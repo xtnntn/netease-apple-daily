@@ -31,7 +31,7 @@ def song(aid):
     return fb.AppleSong(str(aid), "Song " + str(aid), "Artist", "Album", 200000)
 
 
-def match(cookie, apple):
+def match(cookie, apple, **kwargs):
     return dict(id=int(apple.apple_id), name=apple.name, artists=apple.artists,
                 album=apple.album, album_id=123, score=110)
 
@@ -497,6 +497,166 @@ class FeedbackTests(unittest.TestCase):
         with self.assertRaises(dr.TransportError):
             fb.am_paginate(am, "/v1/me/library/playlists")
         am.request.assert_called_once()
+
+
+def ncm(sid, name, artist, dt=200000, album="Album"):
+    return {"id": sid, "name": name, "ar": [{"name": artist}], "al": {"name": album, "id": 9}, "dt": dt}
+
+
+class FakeMatcher:
+    """Records model inputs and replays scripted decisions; never touches the network."""
+
+    def __init__(self, *decisions):
+        self.enabled = True
+        self.decisions = list(decisions)
+        self.calls = []
+
+    def select(self, source, candidates, *, allow_search=True):
+        self.calls.append((source, candidates, allow_search))
+        decision = self.decisions.pop(0)
+        if isinstance(decision, Exception):
+            raise decision
+        candidate_id, terms = decision if isinstance(decision, tuple) else (decision, [])
+        return types.SimpleNamespace(candidate_id=candidate_id, search_terms=terms, reason="model note")
+
+
+class LikeAIMatchingTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(fb.time, "sleep"))
+        self.stack.enter_context(patch.object(fb, "log"))
+        self.results = {}
+        self.search = self.stack.enter_context(patch.object(
+            fb, "ncm_cloudsearch", side_effect=lambda cookie, term, limit=8: list(self.results.get(term, self.default))))
+        self.default = []
+
+    def match(self, apple, matcher, review=None):
+        return fb.match_netease("test", apple, ai_review=True, matcher=matcher, review=review)
+
+    def test_strong_rule_match_skips_ai(self):
+        apple = fb.AppleSong("1", "裸の勇者", "Vaundy", "Album", 200000)
+        self.default = [ncm(11, "裸の勇者", "Vaundy", 200500)]
+        matcher = FakeMatcher()
+        result = self.match(apple, matcher)
+        self.assertEqual((result["id"], result["match_method"]), (11, "rules"))
+        self.assertEqual(matcher.calls, [])
+
+    def test_weak_rule_match_is_reviewed_and_approved(self):
+        apple = fb.AppleSong("1", "Someday, Somewhere", "JOLIN蔡依林", "Album", 200000)
+        self.default = [ncm(21, "Someday, Somewhere", "蔡依林", 200000)]
+        review = {}
+        result = self.match(apple, FakeMatcher("21"), review)
+        self.assertEqual((result["id"], result["match_method"]), (21, "ai_review"))
+        self.assertEqual(review["ai"], "approved")
+        self.assertEqual(review["rule_candidate"]["id"], 21)
+
+    def test_review_can_reject_a_rule_match(self):
+        # A passing rule score with a different artist identity must not be liked.
+        apple = fb.AppleSong("1", "Scatterbrain", "nihmune", "Album", 200000)
+        self.default = [ncm(31, "Scatterbrain", "nihmune band", 200000)]
+        review = {}
+        self.assertIsNone(self.match(apple, FakeMatcher(None), review))
+        self.assertEqual(review["ai"], "rejected")
+
+    def test_ai_recovers_cross_language_match(self):
+        apple = fb.AppleSong("1", "Monstruo", "Ado", "Album", 200000)
+        # Different album keeps the rule score under the minimum, so only AI can match.
+        self.default = [ncm(41, "モンストロ", "Ado", 201000, "残夢"), ncm(42, "MONSTRUO", "Tainy", 230000)]
+        self.assertLess(fb.score_apple_vs_ncm(apple, self.default[0]), fb.FEEDBACK_MIN_SCORE)
+        matcher = FakeMatcher("41")
+        result = self.match(apple, matcher)
+        self.assertEqual((result["id"], result["match_method"]), (41, "ai"))
+        supplied = {c["id"] for c in matcher.calls[0][1]}
+        # Duration filter removes the 30-second-longer song before the model sees it.
+        self.assertEqual(supplied, {"41"})
+
+    def test_incompatible_versions_never_reach_model(self):
+        apple = fb.AppleSong("1", "Kiss & Cry", "Utada", "Album", 200000)
+        self.default = [ncm(51, "Kiss & Cry (Karaoke)", "宇多田ヒカル"), ncm(52, "Kiss & Cry (Live Version)", "宇多田ヒカル"),
+                        ncm(53, "Kiss & Cry", "宇多田ヒカル")]
+        matcher = FakeMatcher("53")
+        self.assertEqual(self.match(apple, matcher)["id"], 53)
+        self.assertEqual({c["id"] for c in matcher.calls[0][1]}, {"53"})
+
+    def test_unknown_candidate_and_ai_failure_defer(self):
+        apple = fb.AppleSong("1", "Monstruo", "Ado", "Album", 200000)
+        self.default = [ncm(41, "モンストロ", "Ado")]
+        for decision in ("999", dr.AIUnavailable("down")):
+            with self.subTest(decision=decision), self.assertRaises(fb.MatchDeferred):
+                self.match(apple, FakeMatcher(decision))
+
+    def test_missing_matcher_defers_reviews_but_keeps_strong_matches(self):
+        strong = fb.AppleSong("1", "Sober", "CREAM", "Album", 200000)
+        self.default = [ncm(61, "Sober", "CREAM")]
+        self.assertEqual(self.match(strong, None)["match_method"], "rules")
+        weak = fb.AppleSong("2", "Monstruo", "Ado", "Album", 200000)
+        self.default = [ncm(41, "モンストロ", "Ado")]
+        with self.assertRaises(fb.MatchDeferred):
+            self.match(weak, None)
+
+    def test_one_supplement_search_then_final_decision(self):
+        apple = fb.AppleSong("1", "Monstruo", "Ado", "Album", 200000)
+        self.results["モンストロ Ado"] = [ncm(41, "モンストロ", "Ado")]
+        matcher = FakeMatcher((None, ["モンストロ Ado"]), "41")
+        self.assertEqual(self.match(apple, matcher)["id"], 41)
+        self.assertEqual([call[2] for call in matcher.calls], [True, False])
+        self.assertEqual(self.search.call_args_list[-1].args[1], "モンストロ Ado")
+
+    def test_rules_only_mode_never_calls_model(self):
+        apple = fb.AppleSong("1", "Someday, Somewhere", "JOLIN蔡依林", "Album", 200000)
+        self.default = [ncm(21, "Someday, Somewhere", "蔡依林")]
+        result = fb.match_netease("test", apple)
+        self.assertEqual((result["id"], result["match_method"]), (21, "rules"))
+
+    def test_sync_likes_defers_without_cooldown_and_stops_calling_model(self):
+        songs = [fb.AppleSong(str(i), "Monstruo " + str(i), "Ado", "Album", 200000) for i in (1, 2)]
+        strong = fb.AppleSong("3", "Sober", "CREAM", "Album", 200000)
+        self.results = {t: [ncm(41, "モンストロ", "Ado")] for s in songs for t in fb._search_terms(s)}
+        self.results.update({t: [ncm(61, "Sober", "CREAM")] for t in fb._search_terms(strong)})
+        matcher = FakeMatcher(dr.AIUnavailable("down"))
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            stack.enter_context(patch.object(fb, "STATE_FILE", Path(tmp) / "state.json"))
+            stack.enter_context(patch.object(fb, "FEEDBACK_AI_MATCHING", True))
+            stack.enter_context(patch.object(dr.AIMatcher, "from_env", return_value=matcher))
+            stack.enter_context(patch.object(fb, "fetch_favorite_songs", return_value=({"id": "f"}, songs + [strong])))
+            like = stack.enter_context(patch.object(fb, "ncm_like", return_value={"code": 200}))
+            state = fb.load_state()
+            stats = fb.sync_likes("test", None, state, set(), False, 10)
+        self.assertEqual(len(matcher.calls), 1)
+        self.assertEqual((stats["deferred"], stats["liked"]), (2, 1))
+        like.assert_called_once_with("test", 61, True)
+        self.assertEqual(state["unmatched_apple_ids"], {})
+
+    def test_sync_likes_rejection_cools_down_and_records_review(self):
+        song_ = fb.AppleSong("1", "Monstruo", "Ado", "Album", 200000)
+        self.default = [ncm(41, "モンストロ", "Ado")]
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            stack.enter_context(patch.object(fb, "STATE_FILE", Path(tmp) / "state.json"))
+            stack.enter_context(patch.object(fb, "FEEDBACK_AI_MATCHING", True))
+            stack.enter_context(patch.object(dr.AIMatcher, "from_env", return_value=FakeMatcher(None)))
+            stack.enter_context(patch.object(fb, "fetch_favorite_songs", return_value=({"id": "f"}, [song_])))
+            like = stack.enter_context(patch.object(fb, "ncm_like"))
+            state = fb.load_state()
+            stats = fb.sync_likes("test", None, state, set(), True, 10)
+        like.assert_not_called()
+        self.assertEqual((stats["ai_rejected"], stats["unmatched"]), (1, 1))
+        self.assertIn("1", state["unmatched_apple_ids"])
+        self.assertEqual(stats["items"][0]["ai"], "rejected")
+        # Model explanations stay out of logs.
+        self.assertNotIn("model note", str(fb.log.call_args_list))
+
+    def test_invalid_ai_config_still_likes_strong_matches(self):
+        strong = fb.AppleSong("3", "Sober", "CREAM", "Album", 200000)
+        self.default = [ncm(61, "Sober", "CREAM")]
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            stack.enter_context(patch.object(fb, "STATE_FILE", Path(tmp) / "state.json"))
+            stack.enter_context(patch.object(fb, "FEEDBACK_AI_MATCHING", True))
+            stack.enter_context(patch.object(dr.AIMatcher, "from_env", side_effect=dr.AIUnavailable("bad")))
+            stack.enter_context(patch.object(fb, "fetch_favorite_songs", return_value=({"id": "f"}, [strong])))
+            stack.enter_context(patch.object(fb, "ncm_like", return_value={"code": 200}))
+            stats = fb.sync_likes("test", None, fb.load_state(), set(), False, 10)
+        self.assertEqual(stats["liked"], 1)
 
 
 REAL_LIKE = fb.ncm_like

@@ -70,6 +70,8 @@ FEEDBACK_REQUEST_SLEEP = float(os.environ.get("FEEDBACK_REQUEST_SLEEP", "1.2") o
 FEEDBACK_LIKE_SLEEP = float(os.environ.get("FEEDBACK_LIKE_SLEEP", "2.0") or "2.0")
 # 首次运行只做 recent 快照、不 scrobble（避免把整窗历史一次打卡）
 FEEDBACK_SCROBBLE_SEED_ONLY_FIRST = _env_bool("FEEDBACK_SCROBBLE_SEED_ONLY_FIRST", True)
+# 红心是否使用 AI 辅助匹配（还需 AI_MATCHING_ENABLED=1）；打卡始终只用规则
+FEEDBACK_AI_MATCHING = _env_bool("FEEDBACK_AI_MATCHING", False)
 
 STATE_FILE = dr._resolve_path(
     os.environ.get("FEEDBACK_STATE_FILE", ""),
@@ -386,76 +388,169 @@ def score_apple_vs_ncm(apple: AppleSong, ncm: dict[str, Any]) -> float:
     return score
 
 
-def match_netease(cookie: str, apple: AppleSong) -> Optional[dict[str, Any]]:
+class MatchDeferred(RuntimeError):
+    """AI review is needed but unavailable this run; retry later without cooldown."""
+
+
+def _artist_names(ncm: dict[str, Any]) -> list[str]:
+    return [str(x.get("name") if isinstance(x, dict) else x) for x in ncm.get("ar") or [] if x]
+
+
+def _primary_artist(apple: AppleSong) -> str:
+    return dr.normalize_title(
+        re.split(r"\s+feat\.?\s+", apple.artists.split(",")[0], flags=re.I)[0]
+    )
+
+
+def _artist_conflict(apple: AppleSong, ncm: dict[str, Any]) -> bool:
+    """True when artists exist on both sides but share nothing (same title, other song)."""
+    a = _primary_artist(apple)
+    norms = [dr.normalize_title(x) for x in _artist_names(ncm)]
+    if not a or not norms:
+        return False
+    if a in norms:
+        return False
+    a_parts = set(p for p in re.split(r"[\s,./&]+", a) if len(p) >= 2)
+    for n in norms:
+        if a in n or n in a:
+            return False
+        if a_parts & set(p for p in re.split(r"[\s,./&]+", n) if len(p) >= 2):
+            return False
+    return True
+
+
+def _strong_ncm_match(apple: AppleSong, ncm: dict[str, Any]) -> bool:
+    """Exact normalized title and primary artist, same version, near-identical duration."""
+    name = str(ncm.get("name") or "")
+    title = dr.normalize_title(apple.name)
+    primary = _primary_artist(apple)
+    dt = ncm.get("dt")
+    return (bool(title) and title == dr.normalize_title(name)
+            and dr.versions_compatible(apple.name, name)
+            and bool(primary) and primary in [dr.normalize_title(x) for x in _artist_names(ncm)]
+            and bool(apple.duration_ms) and type(dt) is int and dt > 0
+            and abs(apple.duration_ms - dt) <= 3000
+            and score_apple_vs_ncm(apple, ncm) >= 90)
+
+
+def _netease_result(s: dict[str, Any], score: float, method: str) -> dict[str, Any]:
+    al = s.get("al") or {}
+    return {
+        "id": int(s.get("id")),
+        "name": s.get("name"),
+        "artists": " / ".join(_artist_names(s)),
+        "album": al.get("name") if isinstance(al, dict) else "",
+        "duration_ms": int(s.get("dt") or 0),
+        "album_id": int(al.get("id") or 0) if isinstance(al, dict) else 0,
+        "score": score,
+        "match_method": method,
+    }
+
+
+def _summary(s: Optional[dict[str, Any]], score: Optional[float] = None) -> Optional[dict[str, Any]]:
+    if not s:
+        return None
+    return {"id": int(s.get("id")), "name": s.get("name"),
+            "artists": " / ".join(_artist_names(s)), "score": score}
+
+
+def _ai_source(apple: AppleSong) -> dict[str, Any]:
+    duration = apple.duration_ms if 0 <= apple.duration_ms <= 86_400_000 else None
+    return {"id": apple.apple_id[:256], "name": apple.name[:512], "artists": apple.artists[:512],
+            "album": apple.album[:512], "duration_ms": duration, "isrc": apple.isrc[:512]}
+
+
+def _ai_candidates(apple: AppleSong, candidates: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bounded, version- and duration-compatible real search results for the model."""
+    out: list[dict[str, Any]] = []
+    for s in sorted(candidates.values(), key=lambda c: score_apple_vs_ncm(apple, c), reverse=True):
+        name = s.get("name")
+        if not isinstance(name, str) or not name.strip() or not dr.versions_compatible(apple.name, name):
+            continue
+        dt = s.get("dt")
+        dt = dt if type(dt) is int and 0 <= dt <= 86_400_000 else None
+        if apple.duration_ms and dt and abs(apple.duration_ms - dt) > 15000:
+            continue
+        al = s.get("al")
+        album = al.get("name") if isinstance(al, dict) and isinstance(al.get("name"), str) else ""
+        out.append({"id": str(int(s["id"])), "name": name[:512],
+                    "artists": [n[:256] for n in _artist_names(s)][:20],
+                    "album": album[:512], "duration_ms": dt})
+        if len(out) >= 30:
+            break
+    return out
+
+
+def _add_search(cookie: str, term: str, candidates: dict[int, dict[str, Any]]) -> None:
+    for s in ncm_cloudsearch(cookie, term, limit=8):
+        sid = int(s.get("id") or 0)
+        if sid and sid not in candidates:
+            candidates[sid] = s
+    time.sleep(FEEDBACK_REQUEST_SLEEP * 0.5)
+
+
+def _search_terms(apple: AppleSong) -> list[str]:
     terms = [
         apple.search_term,
         f"{apple.name} {apple.artists.split(',')[0].strip()}" if apple.artists else apple.name,
         apple.name,
     ]
-    candidates: list[dict[str, Any]] = []
-    seen_terms: set[str] = set()
-    seen_ids: set[int] = set()
+    return list(dict.fromkeys(t.strip() for t in terms if t.strip()))
+
+
+def match_netease(
+    cookie: str, apple: AppleSong, *, ai_review: bool = False,
+    matcher: Optional[dr.AIMatcher] = None, review: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    """Rule match; with ai_review, every result short of a strong match goes to AI.
+
+    Raises MatchDeferred when review is needed but the matcher is unavailable.
+    """
+    terms = _search_terms(apple)
+    candidates: dict[int, dict[str, Any]] = {}
     for term in terms:
-        term = term.strip()
-        if not term or term in seen_terms:
-            continue
-        seen_terms.add(term)
-        for s in ncm_cloudsearch(cookie, term, limit=8):
-            sid = int(s.get("id") or 0)
-            if sid and sid not in seen_ids:
-                seen_ids.add(sid)
-                candidates.append(s)
-        time.sleep(FEEDBACK_REQUEST_SLEEP * 0.5)
+        _add_search(cookie, term, candidates)
 
     best: Optional[tuple[float, dict[str, Any]]] = None
-    for s in candidates:
+    for s in candidates.values():
         sc = score_apple_vs_ncm(apple, s)
         if best is None or sc > best[0]:
             best = (sc, s)
-    if not best or best[0] < FEEDBACK_MIN_SCORE:
-        return None
     # 艺人无任何重合则拒绝（避免同名异曲，如 Autumn Morning 翻奏）
-    ar = best[1].get("ar") or []
-    ar_names = [
-        str(x.get("name") if isinstance(x, dict) else x)
-        for x in ar
-        if x
-    ]
-    a = dr.normalize_title(
-        re.split(r"\s+feat\.?\s+", apple.artists.split(",")[0], flags=re.I)[0]
-    )
-    norms = [dr.normalize_title(x) for x in ar_names]
-    artist_ok = False
-    if a and norms:
-        if a in norms:
-            artist_ok = True
-        else:
-            for n in norms:
-                if a in n or n in a:
-                    artist_ok = True
-                    break
-                if set(p for p in re.split(r"[\s,./&]+", a) if len(p) >= 2) & set(
-                    p for p in re.split(r"[\s,./&]+", n) if len(p) >= 2
-                ):
-                    artist_ok = True
-                    break
-    if a and norms and not artist_ok:
-        return None
-    s = best[1]
-    ar = s.get("ar") or []
-    artists = " / ".join(
-        str(a.get("name") if isinstance(a, dict) else a) for a in ar if a
-    )
-    al = s.get("al") or {}
-    return {
-        "id": int(s.get("id")),
-        "name": s.get("name"),
-        "artists": artists,
-        "album": al.get("name") if isinstance(al, dict) else "",
-        "duration_ms": int(s.get("dt") or 0),
-        "album_id": int(al.get("id") or 0) if isinstance(al, dict) else 0,
-        "score": best[0],
-    }
+    rule = best if best and best[0] >= FEEDBACK_MIN_SCORE and not _artist_conflict(apple, best[1]) else None
+
+    if not ai_review:
+        return _netease_result(rule[1], rule[0], "rules") if rule else None
+    if best and _strong_ncm_match(apple, best[1]):
+        return _netease_result(best[1], best[0], "rules")
+    if review is not None:
+        review["rule_candidate"] = _summary(rule[1], rule[0]) if rule else None
+    if matcher is None or not matcher.enabled:
+        raise MatchDeferred("AI 本轮不可用")
+    try:
+        supplied = _ai_candidates(apple, candidates)
+        decision = matcher.select(_ai_source(apple), supplied)
+        if decision.search_terms:
+            for term in decision.search_terms:
+                if term not in terms:
+                    _add_search(cookie, term, candidates)
+            supplied = _ai_candidates(apple, candidates)
+            decision = matcher.select(_ai_source(apple), supplied, allow_search=False)
+        if review is not None:
+            review["ai_reason"] = decision.reason
+        if decision.candidate_id is None:
+            if review is not None:
+                review["ai"] = "rejected"
+            return None
+        if decision.candidate_id not in {c["id"] for c in supplied}:
+            raise dr.AIUnavailable("AI 返回无效候选")
+    except dr.AIUnavailable:
+        raise MatchDeferred("AI 辅助匹配不可用") from None
+    chosen = candidates[int(decision.candidate_id)]
+    approved = bool(rule) and int(rule[1]["id"]) == int(chosen["id"])
+    if review is not None:
+        review["ai"] = "approved" if approved else "selected"
+    return _netease_result(chosen, score_apple_vs_ncm(apple, chosen), "ai_review" if approved else "ai")
 
 
 def ncm_likelist_ids(cookie: str, uid: int) -> set[int]:
@@ -661,7 +756,20 @@ def sync_likes(
 ) -> dict[str, Any]:
     _prepare_state(state, existing=True)
     stats = dict(source_total=0, already_liked=0, matched=0, unmatched=0,
-                 liked=0, skipped_state=0, skipped_cooldown=0, errors=0, items=[])
+                 liked=0, skipped_state=0, skipped_cooldown=0, errors=0,
+                 ai_reviewed=0, ai_rejected=0, deferred=0, items=[])
+    matcher: Optional[dr.AIMatcher] = None
+    ai_review = False
+    if FEEDBACK_AI_MATCHING:
+        try:
+            matcher = dr.AIMatcher.from_env(dr.ROOT)
+            ai_review = matcher.enabled
+            if not ai_review:
+                log("FEEDBACK_AI_MATCHING=1 但 AI_MATCHING_ENABLED=0，红心仅使用规则匹配")
+        except dr.AIUnavailable:
+            # Never fall back to unreviewed weak matches: defer them instead.
+            log("AI 配置无效：本轮仅红心规则高把握匹配，其余留到下次")
+            ai_review = True
     pl, songs = fetch_favorite_songs(am)
     state["favorites_playlist_id"] = str(pl.get("id") or "")
     stats["source_total"] = len(songs)
@@ -699,22 +807,38 @@ def sync_likes(
         log(f"[like] {apple.artists} - {apple.name}")
         row: dict[str, Any] = {"apple": asdict(apple), "action": None}
         record = pending.get(key)
+        review: dict[str, Any] = {}
         try:
             if record:
                 m = record["netease"]
             else:
                 scanned += 1
-                m = match_netease(cookie, apple)
+                m = match_netease(cookie, apple, ai_review=ai_review, matcher=matcher, review=review)
         except dr.AuthenticationError:
             _checkpoint(state, dry_run)
             raise
+        except MatchDeferred:
+            # No cooldown: the song is retried as soon as AI works again.
+            if matcher is not None and matcher.enabled:
+                log("  AI 辅助匹配不可用，本轮其余待审核歌曲留到下次")
+                matcher = None
+            stats["deferred"] += 1
+            row.update(action="deferred", **review)
+            stats["items"].append(row)
+            continue
         except Exception as exc:
             stats["errors"] += 1
             row.update(action="error", error=_safe_error(exc))
             stats["items"].append(row)
             continue
+        row.update(review)
+        if review.get("ai"):
+            stats["ai_reviewed"] += 1
         if not m:
             stats["unmatched"] += 1
+            if review.get("ai") == "rejected":
+                stats["ai_rejected"] += 1
+                log("  AI 未确认可靠匹配")
             unmatched[key] = {"name": apple.name, "artists": apple.artists,
                               "at": datetime.now().isoformat(timespec="seconds")}
             row["action"] = "unmatched"
@@ -723,7 +847,8 @@ def sync_likes(
             continue
         stats["matched"] += 1
         row["netease"] = m
-        log(f"  → {m['artists']} - {m['name']} id={m['id']} score={m['score']:.0f}")
+        method = m.get("match_method", "rules")
+        log(f"  → {m['artists']} - {m['name']} id={m['id']} score={m['score']:.0f} [{method}]")
         nid = int(m["id"])
         if nid in liked_ncm:
             stats["already_liked"] += 1
