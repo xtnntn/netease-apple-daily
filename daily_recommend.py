@@ -12,7 +12,6 @@ import json
 import math
 import os
 import re
-import shutil
 import socket
 import subprocess
 from email.utils import parsedate_to_datetime
@@ -704,14 +703,10 @@ def ensure_ncm_api() -> None:
         if not any(part in key.upper() for part in ("APPLE", "MUSIC_USER_TOKEN", "DEVELOPER_TOKEN", "AM_CONFIG", "MEDIA_USER_TOKEN", "AI_MATCHING"))
     }
     start_cmd = os.environ.get("NCM_API_START_CMD", "").strip()
-    if start_cmd:
-        log("NCM API 未就绪，执行配置的后台启动命令…")
-        command = ["bash", "-c", start_cmd]
-    else:
-        if not shutil.which("docker"):
-            raise SystemExit("NCM API 未就绪且未找到 Docker；Node 部署请配置 NCM_API_START_CMD 为启动后台服务并及时返回的命令。")
-        log("NCM API 未就绪，尝试 docker compose up -d…")
-        command = ["docker", "compose", "up", "-d"]
+    if not start_cmd:
+        raise SystemExit("NCM API 未就绪；请启动 api-enhanced，或配置 NCM_API_START_CMD 为启动后台服务并及时返回的命令。")
+    log("NCM API 未就绪，执行配置的后台启动命令…")
+    command = ["bash", "-c", start_cmd]
     try:
         result = subprocess.run(
             command, cwd=str(ROOT), check=False, env=env, timeout=30,

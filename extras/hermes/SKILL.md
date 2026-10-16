@@ -19,7 +19,7 @@ metadata:
 
 | 依赖 | 说明 |
 |------|------|
-| api-enhanced | Docker `ncm-api` → `127.0.0.1:3000` |
+| api-enhanced | Node.js `ncm-api` → `127.0.0.1:3000`（`NCM_API_START_CMD` 启动） |
 | 网易云 cookie | `$ROOT/data/cookie.txt` |
 | Apple Music | `MUSIC_USER_TOKEN` 或 `AM_CONFIG` 中的 `media-user-token` |
 | 定时日推 | `scripts/cron_summary.py`（`--no-agent`） |
@@ -46,7 +46,6 @@ python3 "$NETEASE_APPLE_DAILY_ROOT/scripts/cron_summary.py"
 
 ```bash
 cd "$NETEASE_APPLE_DAILY_ROOT"
-docker compose up -d
 ./login.sh qr-init
 ```
 

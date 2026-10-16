@@ -45,7 +45,7 @@ trap 'exit 143' TERM
 HEADERS_FILE="$TEMP_DIR/headers"
 
 need_api() {
-  # Shared startup handles both Node NCM_API_START_CMD and Docker deployments.
+  # Shared startup health-checks the API and runs NCM_API_START_CMD if needed.
   "$PYTHON" -c 'from daily_recommend import ensure_ncm_api; ensure_ncm_api()'
 }
 

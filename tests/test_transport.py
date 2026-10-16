@@ -357,9 +357,10 @@ class StartupTests(unittest.TestCase):
         self.assertNotIn("AM_CONFIG", run.call_args.kwargs["env"])
         self.assertNotIn("private-secret", output.getvalue())
 
-    def test_missing_docker_actionable(self):
-        with patch.dict(os.environ, {}, clear=True), patch.object(dr, "ncm_alive", return_value=False), patch.object(dr.shutil, "which", return_value=None), self.assertRaisesRegex(SystemExit, "NCM_API_START_CMD"):
+    def test_missing_start_command_actionable(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(dr, "ncm_alive", return_value=False), patch.object(dr.subprocess, "run") as run, self.assertRaisesRegex(SystemExit, "NCM_API_START_CMD"):
             dr.ensure_ncm_api()
+        run.assert_not_called()
 
     def test_start_failure_timeout_and_readiness_timeout(self):
         with patch.dict(os.environ, {"NCM_API_START_CMD": "start"}, clear=True), patch.object(dr, "ncm_alive", return_value=False):
