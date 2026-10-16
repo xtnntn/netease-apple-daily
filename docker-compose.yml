@@ -3,7 +3,8 @@
 # Image:    moefurina/ncm-api
 services:
   ncm-api:
-    image: moefurina/ncm-api:latest
+    # Verified 2026-10-15: Docker Hub tag 4.41.1, multi-platform manifest.
+    image: moefurina/ncm-api:4.41.1@sha256:2fcf4dc49313109a91f6cec99c6b36ebd17e8f1fdc89686121dfd14525937896
     container_name: ncm-api
     restart: unless-stopped
     ports:

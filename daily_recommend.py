@@ -7,10 +7,15 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
+import math
 import os
 import re
+import shutil
+import socket
 import subprocess
+from email.utils import parsedate_to_datetime
 import sys
 import time
 import urllib.error
@@ -20,6 +25,8 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
+
+from ai_matching import AIMatcher, AIUnavailable
 
 
 def load_env_file(path: Path) -> None:
@@ -106,40 +113,126 @@ def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+class Tee:
+    """Mirror stdout/stderr into the run log; shared by both entry points."""
+
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, data):
+        for f in self.files:
+            f.write(data)
+            f.flush()
+
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
+
+class AuthenticationError(RuntimeError):
+    """Authentication failed; callers must stop before further writes."""
+
+
+class NCMAuthenticationError(AuthenticationError):
+    pass
+
+
+class AppleAuthenticationError(AuthenticationError):
+    pass
+
+
+class TransportError(RuntimeError):
+    def __init__(self, message: str, *, ambiguous: bool = False):
+        super().__init__(message)
+        # A write may have reached the server. Do not automatically replay it.
+        self.ambiguous = ambiguous
+
+
+class APIError(RuntimeError):
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _urlopen(req: urllib.request.Request, timeout: int):
+    # urllib otherwise forwards explicit Authorization / Music-User-Token headers.
+    return urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout)
+
+
 def http_json(
     url: str,
     method: str = "GET",
     headers: Optional[dict[str, str]] = None,
     body: Any = None,
     timeout: int = 30,
+    *,
+    ambiguous: Optional[bool] = None,
 ) -> tuple[int, Any]:
+    may_write = method.upper() not in ("GET", "HEAD", "OPTIONS") if ambiguous is None else ambiguous
     data = None if body is None else json.dumps(body).encode("utf-8")
     h = {"User-Agent": UA, "Accept": "application/json"}
     if headers:
         h.update(headers)
     if body is not None:
         h.setdefault("Content-Type", "application/json")
-    req = urllib.request.Request(url, data=data, method=method, headers=h)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        req = urllib.request.Request(url, data=data, method=method, headers=h)
+        with _urlopen(req, timeout) as resp:
             raw = resp.read().decode("utf-8")
-            return resp.status, (json.loads(raw) if raw else {})
+            try:
+                result = json.loads(raw) if raw else {}
+            except (ValueError, UnicodeError):
+                raise TransportError("API 返回非 JSON 响应，请检查服务地址或网关。", ambiguous=may_write) from None
+            return resp.status, result
     except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", errors="replace")
+        # Never expose response text: gateways may echo credentials or request URLs.
         try:
-            j = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            j = {"raw": raw[:800]}
-        if not isinstance(j, dict):
-            j = {"data": j}
-        # 供 429 退避：Retry-After 秒数或 HTTP-date（我们只解析整数秒）
-        try:
-            ra = e.headers.get("Retry-After") if e.headers else None
-            if ra is not None:
-                j["_retry_after"] = str(ra).strip()
-        except Exception:
-            pass
-        return e.code, j
+            parsed = json.loads(e.read().decode("utf-8"))
+        except (ValueError, UnicodeError, OSError):
+            parsed = {}
+        result = {}
+        if isinstance(parsed, dict) and isinstance(parsed.get("code"), int):
+            result["code"] = parsed["code"]
+        if e.headers and e.headers.get("Retry-After") is not None:
+            result["_retry_after"] = e.headers.get("Retry-After")
+        return e.code, result
+    except TransportError:
+        raise
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError, UnicodeError) as e:
+        reason = "请求超时" if isinstance(e, (TimeoutError, socket.timeout)) else "网络连接失败或响应无效"
+        suffix = "；写入结果未知，请先核对服务端状态，勿自动重试" if may_write else "；请检查服务地址和网络后重试"
+        raise TransportError(reason + suffix, ambiguous=may_write) from None
+
+
+def apple_page_path(next_url: str, base: str = "https://api.music.apple.com") -> str:
+    """Validate Apple API pagination before attaching authentication headers."""
+    if not isinstance(next_url, str) or not next_url:
+        raise TransportError("Apple 分页地址为空或无效。")
+    if any(c.isspace() or ord(c) < 32 for c in next_url) or "\\" in next_url:
+        raise TransportError("Apple 分页地址无效。")
+    try:
+        target = urllib.parse.urlsplit(next_url)
+        origin = urllib.parse.urlsplit(base)
+        if (origin.scheme != "https" or origin.hostname != "api.music.apple.com"
+                or origin.port not in (None, 443) or origin.username or origin.password):
+            raise ValueError
+        if target.scheme or target.netloc:
+            if (target.scheme != "https" or target.hostname != origin.hostname
+                    or target.port not in (None, 443) or target.username or target.password):
+                raise ValueError
+        if target.fragment or not target.path.startswith("/v1/"):
+            raise ValueError
+        decoded = urllib.parse.unquote(target.path)
+        if "\\" in decoded or any(p in (".", "..") for p in decoded.split("/")):
+            raise ValueError
+    except ValueError:
+        raise TransportError("Apple 分页只允许本站 /v1/ 路径或同源 HTTPS 地址。") from None
+    return urllib.parse.urlunsplit(("", "", target.path, target.query, ""))
 
 
 def parse_yaml_simple_value(path: Path, key: str) -> str:
@@ -169,45 +262,87 @@ def get_music_user_token() -> str:
     return tok
 
 
-def fetch_web_developer_token() -> str:
-    """从 music.apple.com 前端 JS 提取 AMPWebPlay developer JWT（会过期，每次任务刷新）。"""
-    if DEVELOPER_TOKEN:
-        return DEVELOPER_TOKEN
-    req = urllib.request.Request(
-        f"https://music.apple.com/{STOREFRONT}",
-        headers={"User-Agent": UA},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        html = resp.read().decode("utf-8", errors="replace")
-    paths = list(dict.fromkeys(re.findall(r"(/assets/[^\"']+\.js)", html)))
-    for p in paths:
-        url = "https://music.apple.com" + p
-        try:
-            with urllib.request.urlopen(
-                urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30
-            ) as resp:
-                js = resp.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            log(f"拉取 JS 失败 {p}: {e}")
-            continue
-        for h in re.findall(
-            r"eyJ[a-zA-Z0-9_\-]{20,}\.[a-zA-Z0-9_\-]{20,}\.[a-zA-Z0-9_\-]{20,}", js
-        ):
-            if h.count(".") != 2:
-                continue
+def _jwt_payload(token: str) -> dict[str, Any]:
+    try:
+        parts = token.split(".")
+        if len(parts) != 3 or not all(parts):
+            return {}
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data if isinstance(data, dict) else {}
+    except (ValueError, UnicodeError):
+        return {}
+
+
+def _unexpired_jwt(payload: dict[str, Any]) -> bool:
+    exp = payload.get("exp")
+    try:
+        return not isinstance(exp, bool) and math.isfinite(float(exp)) and float(exp) > time.time() + 60
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _apple_web_text(url: str) -> str:
+    # Public pages redirect /cn to /cn/new. Follow at most three same-origin
+    # redirects manually, leaving the authenticated API opener redirect-free.
+    try:
+        for attempt in range(4):
+            parsed = urllib.parse.urlsplit(url)
+            if (parsed.scheme != "https" or parsed.hostname != "music.apple.com"
+                    or parsed.port not in (None, 443) or parsed.username or parsed.password
+                    or any(c.isspace() or ord(c) < 32 for c in url) or "\\" in url):
+                raise TransportError("Apple Music 网页重定向只允许 music.apple.com 的 HTTPS 地址。")
             try:
-                payload = h.split(".")[1]
-                payload += "=" * (-len(payload) % 4)
-                pl = json.loads(base64.urlsafe_b64decode(payload))
-            except Exception:
-                continue
-            if pl.get("iss") == "AMPWebPlay":
-                exp = pl.get("exp")
-                if exp and int(exp) < time.time():
-                    continue
-                log(f"已获取 Apple developer token (iss=AMPWebPlay, exp={exp})")
-                return h
-    raise SystemExit("无法从 music.apple.com 提取 developer token，请检查网络或稍后重试")
+                # Construct each request afresh: public discovery never uses API credentials.
+                with _urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), 30) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as e:
+                location = e.headers.get("Location") if e.headers else None
+                e.close()
+                if e.code not in (301, 302, 303, 307, 308) or not location:
+                    raise TransportError("无法抓取 Apple Music 网页资源，请检查网络后重试。") from None
+                if attempt == 3:
+                    raise TransportError("Apple Music 网页重定向次数超过上限，请稍后重试。") from None
+                url = urllib.parse.urljoin(url, location)
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError):
+        raise TransportError("无法抓取 Apple Music 网页资源，请检查网络后重试。") from None
+
+
+def fetch_web_developer_token() -> str:
+    """Extract a current web JWT; an explicitly configured token always takes precedence."""
+    if DEVELOPER_TOKEN:
+        if not _unexpired_jwt(_jwt_payload(DEVELOPER_TOKEN)):
+            raise AppleAuthenticationError("配置的 DEVELOPER_TOKEN 无效或即将过期，请更新该配置。")
+        return DEVELOPER_TOKEN
+    page_url = f"https://music.apple.com/{STOREFRONT}"
+    html = _apple_web_text(page_url)
+    # Support hashed bundles, modulepreload links, relative paths and query strings.
+    resources = re.findall(r'''(?:src|href)\s*=\s*["']([^"']+)["']''', html, re.I)
+    resources += re.findall(r'''["'](/assets/[^"']+\.js(?:\?[^"']*)?)["']''', html)
+    urls: list[str] = []
+    for resource in resources:
+        url = urllib.parse.urljoin(page_url, resource.replace("&amp;", "&"))
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme == "https" and parsed.netloc == "music.apple.com"
+                and parsed.path.endswith(".js") and url not in urls):
+            urls.append(url)
+    if not urls:
+        raise AppleAuthenticationError("Apple Music 网页未找到 JS 资源，页面结构可能已变化；可配置 DEVELOPER_TOKEN。")
+    fetched = False
+    for url in urls[:12]:
+        try:
+            js = _apple_web_text(url)
+        except TransportError:
+            continue
+        fetched = True
+        for token in re.findall(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", js):
+            payload = _jwt_payload(token)
+            if payload.get("iss") == "AMPWebPlay" and _unexpired_jwt(payload):
+                log("已获取有效的 Apple developer token")
+                return token
+    if not fetched:
+        raise TransportError("Apple Music JS 资源抓取失败，请检查网络后重试。")
+    raise AppleAuthenticationError("Apple Music JS 中没有有效的 developer token（可能已过期），请稍后重试或配置 DEVELOPER_TOKEN。")
 
 
 class AppleMusicClient:
@@ -216,10 +351,12 @@ class AppleMusicClient:
         self.user = user_token
         self.storefront = storefront
         self.base = "https://api.music.apple.com"
-        self.min_interval = max(0.1, AM_MIN_INTERVAL)
-        self.max_429_retries = max(0, AM_429_RETRIES)
+        self.min_interval = min(60.0, max(0.1, AM_MIN_INTERVAL)) if math.isfinite(AM_MIN_INTERVAL) else 0.75
+        self.max_429_retries = min(10, max(0, AM_429_RETRIES))
         self._last_request_at = 0.0
         self._consecutive_429 = 0
+        self._developer_refresh_attempted = False
+        self._configured_developer_token = bool(DEVELOPER_TOKEN)
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -247,17 +384,24 @@ class AppleMusicClient:
             ra = data.get("_retry_after")
         if ra is not None:
             try:
-                return max(1.0, float(str(ra).strip()))
-            except ValueError:
-                pass
-        # 指数退避 + 轻微抖动：3, 6, 12, 24... 封顶 60s
-        base = AM_429_BASE_WAIT * (2**attempt)
-        jitter = 0.25 * (attempt + 1)
+                seconds = float(str(ra).strip())
+            except (TypeError, ValueError, OverflowError):
+                try:
+                    seconds = parsedate_to_datetime(str(ra)).timestamp() - time.time()
+                except (TypeError, ValueError, OverflowError):
+                    seconds = -1.0
+            if math.isfinite(seconds) and seconds >= 0:
+                return min(60.0, seconds)
+        base_wait = AM_429_BASE_WAIT if math.isfinite(AM_429_BASE_WAIT) and AM_429_BASE_WAIT >= 0 else 3.0
+        base = base_wait * (2 ** min(10, max(0, attempt)))
+        jitter = 0.25 * (min(10, max(0, attempt)) + 1)
         return min(60.0, base + jitter)
 
     def request(
         self, path: str, method: str = "GET", body: Any = None, timeout: int = 45
     ) -> tuple[int, Any]:
+        path = apple_page_path(path, self.base)
+        method = method.upper()
         last_code = 0
         last_data: Any = {}
         for attempt in range(self.max_429_retries + 1):
@@ -270,9 +414,21 @@ class AppleMusicClient:
                 timeout=timeout,
             )
             self._last_request_at = time.time()
+            if code in (401, 403):
+                if (method in ("GET", "HEAD") and not self._configured_developer_token
+                        and not self._developer_refresh_attempted):
+                    self._developer_refresh_attempted = True
+                    self.dev = fetch_web_developer_token()
+                    return self.request(path, method=method, body=body, timeout=timeout)
+                configured = "请更新配置的 DEVELOPER_TOKEN，并" if self._configured_developer_token else "developer token 刷新后仍无权限，请"
+                raise AppleAuthenticationError(f"Apple Music 认证失败 (HTTP {code})；{configured}检查 Music User Token / media-user-token 和订阅权限。")
+            if 300 <= code < 400:
+                raise TransportError("Apple API 重定向已拒绝；请检查服务地址。")
+            if not isinstance(data, dict):
+                raise TransportError("Apple API 返回无效 JSON 结构。", ambiguous=method not in ("GET", "HEAD"))
             last_code, last_data = code, data
             if code != 429:
-                if code == 200:
+                if 200 <= code < 300:
                     self._consecutive_429 = 0
                 return code, data
             self._consecutive_429 += 1
@@ -291,7 +447,7 @@ class AppleMusicClient:
     def storefront_info(self) -> dict[str, Any]:
         code, data = self.request("/v1/me/storefront")
         if code != 200:
-            raise RuntimeError(f"storefront 失败 {code}: {data}")
+            raise APIError(f"Apple Music storefront 读取失败 (HTTP {code})。", code)
         return data
 
     def search_songs(self, term: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -301,12 +457,8 @@ class AppleMusicClient:
         code, data = self.request(
             f"/v1/catalog/{self.storefront}/search?{qs}"
         )
-        if code == 429:
-            log(f"  搜索仍 429（已重试）: {term[:60]}")
-            return []
         if code != 200:
-            log(f"  搜索失败 {code}: {json.dumps(data, ensure_ascii=False)[:200]}")
-            return []
+            raise APIError(f"Apple Music 搜索失败 (HTTP {code})；请稍后重试。", code)
         return list(data.get("results", {}).get("songs", {}).get("data") or [])
 
     def list_library_playlists(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -315,13 +467,10 @@ class AppleMusicClient:
         while path and len(out) < limit:
             code, data = self.request(path)
             if code != 200:
-                raise RuntimeError(f"列出播放列表失败 {code}: {data}")
+                raise APIError(f"列出 Apple Music 播放列表失败 (HTTP {code})。", code)
             out.extend(data.get("data") or [])
-            nxt = (data.get("next") or "").strip()
-            path = nxt if nxt else None
-            if path and path.startswith("http"):
-                # next 可能是绝对 URL
-                path = path.replace(self.base, "")
+            nxt = data.get("next") or ""
+            path = apple_page_path(nxt, self.base) if nxt else None
         return out
 
     def find_playlist_by_name(self, name: str) -> Optional[dict[str, Any]]:
@@ -335,7 +484,7 @@ class AppleMusicClient:
             f"/v1/me/library/playlist-folders?limit={min(limit, 100)}"
         )
         if code != 200:
-            raise RuntimeError(f"列出播放列表文件夹失败 {code}: {data}")
+            raise APIError(f"列出 Apple Music 播放列表文件夹失败 (HTTP {code})。", code)
         return list(data.get("data") or [])
 
     def find_folder_by_name(self, name: str) -> Optional[dict[str, Any]]:
@@ -350,12 +499,10 @@ class AppleMusicClient:
             "/v1/me/library/playlist-folders", method="POST", body=body
         )
         if code not in (200, 201):
-            raise RuntimeError(
-                f"创建播放列表文件夹失败 {code}: {json.dumps(data, ensure_ascii=False)[:500]}"
-            )
+            raise APIError(f"创建 Apple Music 播放列表文件夹失败 (HTTP {code})。", code)
         items = data.get("data") or []
         if not items:
-            raise RuntimeError(f"创建文件夹无返回 data: {data}")
+            raise TransportError("创建 Apple Music 文件夹后未返回 data；请核对资料库后重试。", ambiguous=True)
         return items[0]
 
     def resolve_playlist_folder(self) -> Optional[dict[str, Any]]:
@@ -434,8 +581,8 @@ class AppleMusicClient:
         code, data = self.request("/v1/me/library/playlists", method="POST", body=body)
         if code not in (200, 201):
             # 回退：仅 parent 建空列表，再 add_tracks（部分环境同时带 tracks 时 parent 不生效）
-            if parent_folder_id and track_ids:
-                log("创建时 parent+tracks 失败，改为先建空列表再加歌…")
+            if code in (400, 422) and parent_folder_id and track_ids:
+                log("创建时 parent+tracks 参数被拒绝，改为先建空列表再加歌…")
                 body2: dict[str, Any] = {
                     "attributes": {"name": name, "description": description},
                     "relationships": {
@@ -453,21 +600,17 @@ class AppleMusicClient:
                     "/v1/me/library/playlists", method="POST", body=body2
                 )
                 if code not in (200, 201):
-                    raise RuntimeError(
-                        f"创建播放列表失败 {code}: {json.dumps(data, ensure_ascii=False)[:800]}"
-                    )
+                    raise APIError(f"创建 Apple Music 播放列表失败 (HTTP {code})。", code)
                 items = data.get("data") or []
                 if not items:
-                    raise RuntimeError(f"创建播放列表无返回 data: {data}")
+                    raise TransportError("创建 Apple Music 播放列表后未返回 data；请核对资料库后重试。", ambiguous=True)
                 pl = items[0]
                 self.add_tracks(str(pl.get("id")), track_ids)
                 return pl
-            raise RuntimeError(
-                f"创建播放列表失败 {code}: {json.dumps(data, ensure_ascii=False)[:800]}"
-            )
+            raise APIError(f"创建 Apple Music 播放列表失败 (HTTP {code})。", code)
         items = data.get("data") or []
         if not items:
-            raise RuntimeError(f"创建播放列表无返回 data: {data}")
+            raise TransportError("创建 Apple Music 播放列表后未返回 data；请核对资料库后重试。", ambiguous=True)
         pl = items[0]
         # 若创建时带了 tracks 但实际为空，补加
         if track_ids and parent_folder_id:
@@ -495,23 +638,44 @@ class AppleMusicClient:
                 body=body,
             )
             if code not in (200, 201, 204):
-                raise RuntimeError(
-                    f"添加曲目失败 {code}: {json.dumps(data, ensure_ascii=False)[:500]}"
-                )
+                raise APIError(f"添加 Apple Music 曲目失败 (HTTP {code})。", code)
             time.sleep(0.3)
 
 
 def ncm_get(path: str, cookie: str, extra: Optional[dict[str, str]] = None) -> Any:
-    params: dict[str, str] = {
-        "cookie": cookie,
-        "timestamp": str(int(time.time() * 1000)),
-    }
-    if extra:
-        params.update(extra)
+    params = dict(extra or {})
+    params.pop("cookie", None)
+    params["timestamp"] = str(int(time.time() * 1000))
+    # Legacy name retained for callers; POST carries the cookie without URL leakage.
     url = f"{NCM_API_BASE}{path}?{urllib.parse.urlencode(params)}"
-    code, data = http_json(url)
-    if code != 200 and not isinstance(data, dict):
-        raise RuntimeError(f"NCM {path} HTTP {code}")
+    is_mutation = path.split("?", 1)[0].rstrip("/") in ("/like", "/scrobble")
+    code, data = http_json(url, method="POST", body={"cookie": cookie}, ambiguous=is_mutation)
+    if not isinstance(data, dict):
+        raise TransportError("网易云 API 返回无效 JSON 结构。", ambiguous=is_mutation)
+    nested = data.get("data")
+    api_codes = [data.get("code")]
+    if isinstance(nested, dict):
+        api_codes.append(nested.get("code"))
+    if code in (301, 302, 401, 403) or any(c in (301, 302, 401, 403) for c in api_codes):
+        raise NCMAuthenticationError("网易云登录已失效或无权限，请运行 login.sh qr 更新 cookie 后重试。")
+    if code == 429 or (is_mutation and code == 405 and data.get("code") == 405):
+        # Preserve explicit NCM rate limits for caller backoff/stop handling.
+        return {"code": code}
+    if is_mutation and 500 <= code < 600:
+        # A gateway/server failure does not prove that the upstream write failed.
+        raise TransportError(f"网易云 API HTTP {code}；写入结果未知，请先核对服务端状态，勿自动重试。", ambiguous=True)
+    if code != 200:
+        raise APIError(f"网易云 API HTTP {code}；请检查服务状态后重试。", code)
+    if path == "/login/status":
+        profile = nested.get("profile") if isinstance(nested, dict) else data.get("profile")
+        if not isinstance(profile, dict) or not profile.get("userId"):
+            raise NCMAuthenticationError("网易云登录状态无有效账号，请运行 login.sh qr 更新 cookie 后重试。")
+    if data.get("code") not in (200, None):
+        # Business failures may echo request credentials, too. Preserve only the code.
+        api_code = data.get("code")
+        return {"code": api_code} if isinstance(api_code, int) else {}
+    if is_mutation and data.get("code") != 200:
+        return {}
     return data
 
 
@@ -525,38 +689,47 @@ def load_cookie() -> str:
 
 
 def ncm_alive() -> bool:
-    """首页是 HTML，不走 JSON；用 banner 探测。"""
     try:
-        code, data = http_json(f"{NCM_API_BASE}/banner?type=0", timeout=5)
+        code, data = http_json(f"{NCM_API_BASE}/banner?type=0", timeout=2)
         return code == 200 and isinstance(data, dict)
-    except Exception:
-        try:
-            req = urllib.request.Request(
-                f"{NCM_API_BASE}/", headers={"User-Agent": UA}
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
+    except (TransportError, APIError):
+        return False
 
 
 def ensure_ncm_api() -> None:
     if ncm_alive():
         return
-    log("NCM API 未就绪，尝试 docker compose up -d ...")
-    env = os.environ.copy()
-    subprocess.run(
-        ["docker", "compose", "up", "-d"],
-        cwd=str(ROOT),
-        check=False,
-        env=env,
-    )
-    for _ in range(40):
+    env = {
+        key: value for key, value in os.environ.items()
+        if not any(part in key.upper() for part in ("APPLE", "MUSIC_USER_TOKEN", "DEVELOPER_TOKEN", "AM_CONFIG", "MEDIA_USER_TOKEN", "AI_MATCHING"))
+    }
+    start_cmd = os.environ.get("NCM_API_START_CMD", "").strip()
+    if start_cmd:
+        log("NCM API 未就绪，执行配置的后台启动命令…")
+        command = ["bash", "-c", start_cmd]
+    else:
+        if not shutil.which("docker"):
+            raise SystemExit("NCM API 未就绪且未找到 Docker；Node 部署请配置 NCM_API_START_CMD 为启动后台服务并及时返回的命令。")
+        log("NCM API 未就绪，尝试 docker compose up -d…")
+        command = ["docker", "compose", "up", "-d"]
+    try:
+        result = subprocess.run(
+            command, cwd=str(ROOT), check=False, env=env, timeout=30,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit("NCM API 启动命令超过 30 秒；请确保命令启动后台服务并及时返回。") from None
+    except OSError:
+        raise SystemExit("无法执行 NCM API 启动命令；请检查命令路径和依赖。") from None
+    if result.returncode:
+        raise SystemExit(f"NCM API 启动失败 (退出码 {result.returncode})；请检查服务日志和启动配置。")
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
         if ncm_alive():
             log("NCM API 已就绪")
             return
         time.sleep(1)
-    raise SystemExit(f"无法连接 NCM API: {NCM_API_BASE}")
+    raise SystemExit("NCM API 在 40 秒内未就绪；请检查 NCM_API_BASE、监听端口和服务日志。")
 
 
 def artists_str(ar: list[Any]) -> str:
@@ -585,10 +758,8 @@ class NeteaseSong:
 
 def fetch_daily_songs(cookie: str) -> list[NeteaseSong]:
     body = ncm_get("/recommend/songs", cookie)
-    if isinstance(body, dict) and body.get("code") not in (200, None):
-        raise RuntimeError(
-            f"/recommend/songs 失败: {json.dumps(body, ensure_ascii=False)[:500]}"
-        )
+    if body.get("code") != 200:
+        raise APIError("网易云每日推荐读取失败；请检查 API 服务和账号状态。", int(body.get("code") or 0))
     data = body.get("data") or body
     daily = data.get("dailySongs") or data.get("recommend") or []
     songs: list[NeteaseSong] = []
@@ -620,8 +791,44 @@ def normalize_title(s: str) -> str:
     return s.strip()
 
 
+def version_tags(title: str) -> set[str]:
+    """Keep recording qualifiers before normalize_title removes brackets."""
+    text = title.casefold()
+    patterns = {
+        "instrumental": r"\b(?:karaoke|instrumental|off[\s-]*vocal)\b|カラオケ|インスト(?:ゥルメンタル)?|伴奏|无人声|無人声",
+        "live": r"\blive\b|ライブ|现场版|現場版",
+        "remix": r"\bremix\b|リミックス|混音版",
+        "acoustic": r"\bacoustic\b|アコースティック|不插电|不插電",
+        "solo": r"\bsolo\b|ソロ|独唱|獨唱",
+        "game": r"\bgame[\s-]+(?:version|ver\.?)\b|ゲーム[\s・]*(?:バージョン|サイズ)",
+        "short": r"\b(?:tv[\s-]*(?:size|version|ver\.?)|short[\s-]*(?:version|ver\.?))\b|ショート|电视版|電視版",
+        "rerecording": r"\bre[\s-]*record(?:ing|ed)\b|再録|再录",
+        "tv": r"\btaylor[’']s version\b",
+    }
+    # Qualifiers belong to brackets or a version suffix, not ordinary lyrics
+    # such as "I Live For You" or the Japanese title "ショートケーキ".
+    fragments = re.findall(r"[\(（\[【]([^\)）\]】]*)[\)）\]】]", text)
+    suffix = re.search(r"\s[-–—]\s+(.+)$", text)
+    if suffix:
+        fragments.append(suffix.group(1))
+    suffix = re.search(
+        r"\s((?:karaoke|instrumental|off[\s-]*vocal|remix|acoustic|solo)"
+        r"(?:\s+(?:version|ver\.?))?|live\s+(?:version|ver\.?)|"
+        r"伴奏(?:版)?|カラオケ|インスト(?:ゥルメンタル)?|现场版|現場版|ライブ版)$", text)
+    if suffix:
+        fragments.append(suffix.group(1))
+    return {tag for tag, pattern in patterns.items()
+            if any(re.search(pattern, fragment) for fragment in fragments)}
+
+
+def versions_compatible(source: str, candidate: str) -> bool:
+    return version_tags(source) == version_tags(candidate)
+
+
 def score_match(ns: NeteaseSong, song: dict[str, Any]) -> float:
     attrs = song.get("attributes") or {}
+    if not versions_compatible(ns.name, str(attrs.get("name") or "")):
+        return 0.0
     t = normalize_title(str(attrs.get("name") or ""))
     a = normalize_title(str(attrs.get("artistName") or ""))
     al = normalize_title(str(attrs.get("albumName") or ""))
@@ -663,57 +870,121 @@ def score_match(ns: NeteaseSong, song: dict[str, Any]) -> float:
     return score
 
 
-def match_catalog(am: AppleMusicClient, ns: NeteaseSong) -> Optional[dict[str, Any]]:
-    terms = [
+def _strong_catalog_match(ns: NeteaseSong, song: dict[str, Any]) -> bool:
+    attrs = song.get("attributes") or {}
+    artist = normalize_title(str(attrs.get("artistName") or ""))
+    primary = normalize_title(ns.artists.split(" / ")[0])
+    return (score_match(ns, song) >= max(90, MATCH_EARLY_SCORE)
+            and normalize_title(ns.name) == normalize_title(str(attrs.get("name") or ""))
+            and bool(primary) and artist == primary)
+
+
+def _catalog_metadata(song: dict[str, Any]) -> dict[str, Any]:
+    attrs = song.get("attributes") or {}
+    return {"id": str(song["id"]), "name": attrs.get("name") or "",
+            "artists": attrs.get("artistName") or "", "album": attrs.get("albumName") or "",
+            "duration_ms": attrs.get("durationInMillis") or 0, "isrc": attrs.get("isrc") or ""}
+
+
+def match_catalog(
+    am: AppleMusicClient, ns: NeteaseSong, *, matcher: Optional[AIMatcher] = None,
+) -> Optional[dict[str, Any]]:
+    # A caller that processes a batch owns one matcher, sharing budget and cache.
+    if matcher is None:
+        matcher = AIMatcher.from_env(ROOT)
+    use_ai = matcher.enabled
+    terms = list(dict.fromkeys(term.strip() for term in (
         ns.search_term,
         f"{ns.name} {ns.artists.split(' / ')[0]}" if ns.artists else ns.name,
         ns.name,
-    ]
-    # 去重并去掉与 search_term 相同的重复查询
-    uniq_terms: list[str] = []
-    seen: set[str] = set()
-    for term in terms:
-        term = term.strip()
-        if not term or term in seen:
-            continue
-        seen.add(term)
-        uniq_terms.append(term)
+    ) if term.strip()))
+    candidates: dict[str, dict[str, Any]] = {}
 
-    candidates: list[dict[str, Any]] = []
-    best: Optional[tuple[float, dict[str, Any]]] = None
+    def consider(batch: list[dict[str, Any]]) -> None:
+        for song in batch:
+            if not isinstance(song, dict):
+                continue
+            attrs = song.get("attributes")
+            if not isinstance(attrs, dict) or not all(isinstance(attrs.get(k), str)
+                    for k in ("name", "artistName", "albumName")) or not attrs["name"].strip():
+                continue
+            duration = attrs.get("durationInMillis") or 0
+            if type(duration) is not int or not 0 <= duration <= 86400000:
+                continue
+            if use_ai and ns.duration_ms and duration and abs(ns.duration_ms - duration) > 15000:
+                continue
+            sid = str(song.get("id") or "")
+            if sid.isdigit() and versions_compatible(ns.name, attrs["name"]):
+                candidates.setdefault(sid, song)
 
-    def consider(songs: list[dict[str, Any]]) -> None:
-        nonlocal best
-        for song in songs:
-            sc = score_match(ns, song)
-            if best is None or sc > best[0]:
-                best = (sc, song)
+    def ranked() -> list[dict[str, Any]]:
+        return sorted(candidates.values(), key=lambda s: (
+            score_match(ns, s),
+            str((s.get("attributes") or {}).get("name") or "").casefold() == ns.name.casefold(),
+        ), reverse=True)
 
-    for i, term in enumerate(uniq_terms):
-        batch = am.search_songs(term, limit=10)
-        candidates.extend(batch)
+    for i, term in enumerate(terms):
+        batch = am.search_songs(term, limit=25 if use_ai else 10)
         consider(batch)
-        # 高分命中：停止后续关键词
-        if best and best[0] >= MATCH_EARLY_SCORE:
-            break
-        # 已有不错匹配（>=70）且已搜过 ≥2 个 term：跳过更模糊的纯歌名
-        if i >= 1 and best and best[0] >= 70:
-            break
-        # 连续 429 耗尽重试后：多歇一会再继续
+        ordered = ranked()
+        best = ordered[0] if ordered else None
+        if best:
+            if use_ai and _strong_catalog_match(ns, best):
+                break
+            if not use_ai and (score_match(ns, best) >= MATCH_EARLY_SCORE
+                               or (i >= 1 and score_match(ns, best) >= 70)):
+                break
         if not batch and am._consecutive_429 > 0:
             time.sleep(min(8.0, 1.5 * am._consecutive_429))
 
-    if not best or best[0] < 55:
+    ordered = ranked()
+    song = ordered[0] if ordered else None
+    method = "rules"
+    reason = ""
+    if use_ai and (song is None or not _strong_catalog_match(ns, song)):
+        source = {"id": str(ns.id), "name": ns.name, "artists": ns.artists,
+                  "album": ns.album, "duration_ms": ns.duration_ms}
+        # Only eligible, bounded real candidates can be selected, even by AI.
+        def eligible() -> list[dict[str, Any]]:
+            result = []
+            for candidate in ranked():
+                metadata = _catalog_metadata(candidate)
+                duration = metadata["duration_ms"]
+                if ns.duration_ms and duration and abs(ns.duration_ms - duration) > 15000:
+                    continue
+                result.append(metadata)
+            return result[:30]
+
+        try:
+            supplied = eligible()
+            decision = matcher.select(source, supplied)
+            if decision.search_terms:
+                for term in decision.search_terms:
+                    if term not in terms:
+                        consider(am.search_songs(term, limit=25))
+                supplied = eligible()
+                decision = matcher.select(source, supplied, allow_search=False)
+            allowed = {s["id"] for s in supplied}
+            if decision.candidate_id is None:
+                log("  AI 未确认可靠匹配")
+                return None
+            if decision.candidate_id not in allowed:
+                raise AIUnavailable("AI 返回无效候选")
+            song = candidates[decision.candidate_id]
+            method = "ai"
+            reason = getattr(decision, "reason", "")
+        except AIUnavailable:
+            log("  AI 辅助匹配不可用，本曲保留为未匹配")
+            return None
+    elif song is None or score_match(ns, song) < 55:
         return None
-    song = best[1]
     attrs = song.get("attributes") or {}
     return {
-        "id": str(song.get("id")),
-        "name": attrs.get("name"),
-        "artistName": attrs.get("artistName"),
-        "albumName": attrs.get("albumName"),
-        "url": attrs.get("url"),
-        "score": best[0],
+        "id": str(song["id"]), "name": attrs.get("name"),
+        "artistName": attrs.get("artistName"), "albumName": attrs.get("albumName"),
+        "url": attrs.get("url"), "score": score_match(ns, song),
+        "match_method": method,
+        **({"ai_reason": reason} if method == "ai" else {}),
     }
 
 
@@ -721,20 +992,6 @@ def main() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"daily-{TODAY}.log"
-
-    class Tee:
-        def __init__(self, *files):
-            self.files = files
-
-        def write(self, data):
-            for f in self.files:
-                f.write(data)
-                f.flush()
-
-        def flush(self):
-            for f in self.files:
-                f.flush()
-
     log_fp = open(log_file, "a", encoding="utf-8")
     sys.stdout = Tee(sys.__stdout__, log_fp)  # type: ignore
     sys.stderr = Tee(sys.__stderr__, log_fp)  # type: ignore
@@ -743,12 +1000,9 @@ def main() -> int:
     ensure_ncm_api()
     cookie = load_cookie()
 
-    try:
-        st = ncm_get("/login/status", cookie)
-        profile = (st.get("data") or {}).get("profile") or {}
-        log(f"网易云账号: {profile.get('nickname') or '?'}")
-    except Exception as e:
-        log(f"警告: 登录状态检查失败: {e}")
+    st = ncm_get("/login/status", cookie)
+    profile = (st.get("data") or {}).get("profile") or st.get("profile") or {}
+    log(f"网易云账号: {profile.get('nickname') or '?'}")
 
     songs = fetch_daily_songs(cookie)
     log(f"日推曲目数: {len(songs)}")
@@ -797,11 +1051,12 @@ def main() -> int:
         )
         return 0
 
+    matcher = AIMatcher.from_env(ROOT)
     results: list[dict[str, Any]] = []
     track_ids: list[str] = []
     for i, ns in enumerate(songs, 1):
         log(f"[{i}/{len(songs)}] {ns.artists} - {ns.name}")
-        m = match_catalog(am, ns)
+        m = match_catalog(am, ns, matcher=matcher)
         row: dict[str, Any] = {
             "netease": asdict(ns),
             "match": m,
@@ -872,8 +1127,10 @@ def main() -> int:
                 )
                 have = len((detail.get("data") or [])) if code == 200 else -1
                 log(f"追加后曲目数: {have}")
-        except Exception as e:
-            log(f"校验/补加曲目时出错（播放列表可能已含歌）: {e}")
+        except (AuthenticationError, TransportError):
+            raise
+        except Exception:
+            log("校验/补加曲目失败；播放列表可能已含歌，请在 App 中核对。")
 
     man = {
         "date": TODAY,
@@ -908,6 +1165,9 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except (AuthenticationError, TransportError, APIError, AIUnavailable) as e:
+        print(str(e), file=sys.stderr)
+        raise SystemExit(1)
     except KeyboardInterrupt:
         print("中断", file=sys.stderr)
         raise SystemExit(130)

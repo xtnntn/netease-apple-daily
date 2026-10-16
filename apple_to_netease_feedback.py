@@ -15,8 +15,8 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
-import urllib.parse
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -107,13 +107,6 @@ def log(msg: str) -> None:
 # Apple Music 读取
 # ---------------------------------------------------------------------------
 
-def _strip_base(path: str, base: str) -> str:
-    path = (path or "").strip()
-    if path.startswith("http"):
-        path = path.replace(base, "")
-    return path
-
-
 def am_paginate(
     am: dr.AppleMusicClient, first_path: str, limit: int = 500
 ) -> list[dict[str, Any]]:
@@ -122,13 +115,11 @@ def am_paginate(
     while path and len(out) < limit:
         code, data = am.request(path)
         if code != 200:
-            raise RuntimeError(
-                f"Apple GET {path} 失败 {code}: {json.dumps(data, ensure_ascii=False)[:400]}"
-            )
+            raise RuntimeError(f"Apple 分页读取失败 HTTP {code}")
         batch = data.get("data") or []
         out.extend(batch)
-        nxt = _strip_base(data.get("next") or "", am.base)
-        path = nxt or None
+        nxt = data.get("next") or ""
+        path = dr.apple_page_path(nxt, am.base) if nxt else None
         if path:
             time.sleep(0.15)
     return out[:limit]
@@ -271,16 +262,17 @@ def ncm_cloudsearch(cookie: str, keywords: str, limit: int = 8) -> list[dict[str
         {"keywords": keywords, "limit": str(limit), "type": "1"},
     )
     if not isinstance(data, dict):
-        return []
-    # 部分部署 code 在外层
-    if data.get("code") not in (200, None) and not (data.get("result") or {}).get("songs"):
-        # 回退 search
+        raise RuntimeError("网易云搜索响应无效")
+    if data.get("code") not in (200, None):
         data = dr.ncm_get(
-            "/search",
-            cookie,
+            "/search", cookie,
             {"keywords": keywords, "limit": str(limit), "type": "1"},
         )
-    result = data.get("result") or {}
+    if not isinstance(data, dict) or data.get("code") not in (200, None):
+        raise RuntimeError("网易云搜索失败")
+    result = data.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("songs", []), list):
+        raise RuntimeError("网易云搜索响应缺少结果")
     return list(result.get("songs") or [])
 
 
@@ -306,6 +298,8 @@ def _version_tags(title: str) -> set[str]:
 def score_apple_vs_ncm(apple: AppleSong, ncm: dict[str, Any]) -> float:
     """与 daily_recommend.score_match 对称：Apple 为「真」，NCM 为候选。"""
     ncm_name = str(ncm.get("name") or "")
+    if not dr.versions_compatible(apple.name, ncm_name):
+        return 0.0
     nt = dr.normalize_title(ncm_name)
     ar = ncm.get("ar") or ncm.get("artists") or []
     # 主艺人 + 全体艺人串，便于 feat.
@@ -466,8 +460,9 @@ def match_netease(cookie: str, apple: AppleSong) -> Optional[dict[str, Any]]:
 
 def ncm_likelist_ids(cookie: str, uid: int) -> set[int]:
     data = dr.ncm_get("/likelist", cookie, {"uid": str(uid)})
-    ids = data.get("ids") or []
-    return {int(x) for x in ids if x is not None}
+    if not isinstance(data, dict) or data.get("code") != 200 or not isinstance(data.get("ids"), list):
+        raise RuntimeError("网易云 likelist 读取失败；停止反馈写入")
+    return {int(x) for x in data["ids"] if x is not None}
 
 
 def ncm_like(
@@ -485,12 +480,12 @@ def ncm_like(
             {"id": str(song_id), "like": "true" if like else "false"},
         )
         code = last.get("code")
-        if code in (200, None):
+        if code == 200:
             return last
         msg = str(last.get("msg") or last.get("message") or "")
-        if code == 405 or "频繁" in msg:
+        if (code == 405 or "频繁" in msg) and attempt < retries:
             wait = 8 * (attempt + 1) + (attempt * 2)
-            log(f"  红心限流 code={code}，{wait}s 后重试 ({attempt + 1}/{retries})")
+            log(f"  红心限流，{wait}s 后重试 ({attempt + 1}/{retries})")
             time.sleep(wait)
             continue
         return last
@@ -515,44 +510,96 @@ def ncm_scrobble(
 # 状态
 # ---------------------------------------------------------------------------
 
+# Completed histories are oldest-to-newest; pending records are never truncated.
+RECENT_HISTORY_LIMIT = 500
+SCROBBLE_HISTORY_LIMIT = 800
+UNMATCHED_RETRY_SECONDS = 7 * 24 * 60 * 60
+
+
+def _prepare_state(state: dict[str, Any], existing: bool = False) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        raise ValueError("反馈状态必须是 JSON object")
+    for key in ("liked_netease_ids", "liked_apple_ids", "scrobbled_apple_ids", "seen_recent_apple_ids"):
+        if key in state and not isinstance(state[key], list):
+            raise ValueError(f"反馈状态字段 {key} 必须是 list")
+        state.setdefault(key, [])
+    for key in ("unmatched_apple_ids", "pending_scrobbles", "pending_likes"):
+        if key in state and not isinstance(state[key], dict):
+            raise ValueError(f"反馈状态字段 {key} 必须是 object")
+        state.setdefault(key, {})
+    # Any existing legacy file counts as initialized, even an empty snapshot.
+    # Replaying old history cannot safely recover the previous version's losses.
+    state.setdefault("recent_initialized", existing)
+    if not isinstance(state["recent_initialized"], bool):
+        raise ValueError("反馈状态 recent_initialized 必须是 bool")
+    for key in ("pending_scrobbles", "pending_likes"):
+        for aid, record in state[key].items():
+            if not isinstance(record, dict) or record.get("status") not in ("pending", "unmatched", "unknown"):
+                raise ValueError(f"反馈状态 {key} 记录无效")
+            try:
+                song = AppleSong(**record["apple"])
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"反馈状态 {key} 缺少歌曲元数据") from exc
+            text_fields = (song.apple_id, song.name, song.artists, song.album, song.isrc, song.library_id)
+            if (not all(isinstance(value, str) for value in text_fields)
+                    or not song.apple_id or not song.name
+                    or type(song.duration_ms) is not int or song.duration_ms < 0
+                    or str(aid) != song.apple_id):
+                raise ValueError(f"反馈状态 {key} 歌曲元数据无效")
+            matched = record.get("netease")
+            if matched is not None or key == "pending_likes":
+                if (not isinstance(matched, dict) or type(matched.get("id")) is not int
+                        or matched["id"] <= 0
+                        or not all(isinstance(matched.get(field), str) for field in ("name", "artists"))
+                        or type(matched.get("score")) not in (int, float)
+                        or type(matched.get("album_id", 0)) is not int):
+                    raise ValueError(f"反馈状态 {key} 匹配元数据无效")
+    state.setdefault("favorites_playlist_id", "")
+    state.setdefault("updated_at", None)
+    return state
+
+
+class FeedbackStateError(RuntimeError):
+    pass
+
+
 def load_state() -> dict[str, Any]:
-    if not STATE_FILE.is_file():
-        return {
-            "liked_netease_ids": [],
-            "liked_apple_ids": [],
-            "scrobbled_apple_ids": [],
-            "seen_recent_apple_ids": [],
-            "unmatched_apple_ids": {},
-            "favorites_playlist_id": "",
-            "updated_at": None,
-        }
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {
-            "liked_netease_ids": [],
-            "liked_apple_ids": [],
-            "scrobbled_apple_ids": [],
-            "seen_recent_apple_ids": [],
-            "unmatched_apple_ids": {},
-            "favorites_playlist_id": "",
-            "updated_at": None,
-        }
+        raw = STATE_FILE.read_text(encoding="utf-8")
+        return _prepare_state(json.loads(raw), existing=True)
+    except FileNotFoundError:
+        return _prepare_state({})
+    except (ValueError, TypeError) as exc:
+        raise FeedbackStateError("反馈状态损坏，已保留原文件，请人工检查 FEEDBACK_STATE_FILE") from exc
 
 
 def save_state(state: dict[str, Any]) -> None:
-    state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    updated = datetime.now().isoformat(timespec="seconds")
+    payload = json.dumps({**state, "updated_at": updated}, ensure_ascii=False, indent=2)
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=STATE_FILE.parent,
+                                         prefix=f".{STATE_FILE.name}.", delete=False) as fp:
+            temp_path = Path(fp.name)
+            os.fchmod(fp.fileno(), 0o600)
+            fp.write(payload)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temp_path, STATE_FILE)
+        state["updated_at"] = updated
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _checkpoint(state: dict[str, Any], dry_run: bool) -> None:
+    if not dry_run:
+        save_state(state)
 
 
 def _as_id_set(vals: Any) -> set[str]:
-    out: set[str] = set()
-    for v in vals or []:
-        out.add(str(v))
-    return out
+    return {str(v) for v in vals or []}
 
 
 def _as_int_set(vals: Any) -> set[int]:
@@ -565,265 +612,284 @@ def _as_int_set(vals: Any) -> set[int]:
     return out
 
 
+def _remember(state: dict[str, Any], field: str, value: Any, bound: int = 0) -> None:
+    values = state[field]
+    if value in values:
+        values.remove(value)
+    values.append(value)
+    if bound:
+        del values[:-bound]
+
+
+def _cooling_down(record: Any) -> bool:
+    if not isinstance(record, dict):
+        return False
+    try:
+        checked = datetime.fromisoformat(record.get("at", "")).timestamp()
+        return time.time() - checked < UNMATCHED_RETRY_SECONDS
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _safe_error(exc: Exception) -> str:
+    # Never serialize raw API responses or exception messages, which can contain cookies.
+    if isinstance(exc, dr.AuthenticationError):
+        return "认证失效，请更新凭据后重试"
+    if isinstance(exc, FeedbackStateError):
+        return "反馈状态损坏，已保留原文件，请人工检查 FEEDBACK_STATE_FILE"
+    return f"请求失败 ({type(exc).__name__})"
+
+
+def _response_error(response: Any) -> str:
+    code = response.get("code") if isinstance(response, dict) else None
+    return f"网易云未确认成功 (code={code if isinstance(code, int) else 'missing'})"
+
+
+def _rate_limited(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    return response.get("code") in (405, 429) or "频繁" in str(response.get("msg") or response.get("message") or "")
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
 def sync_likes(
-    cookie: str,
-    am: dr.AppleMusicClient,
-    state: dict[str, Any],
-    already_liked: set[int],
-    dry_run: bool,
-    limit: int,
+    cookie: str, am: dr.AppleMusicClient, state: dict[str, Any],
+    already_liked: set[int], dry_run: bool, limit: int,
 ) -> dict[str, Any]:
-    stats = {
-        "source_total": 0,
-        "already_liked": 0,
-        "matched": 0,
-        "unmatched": 0,
-        "liked": 0,
-        "skipped_state": 0,
-        "errors": 0,
-        "items": [],
-    }
+    _prepare_state(state, existing=True)
+    stats = dict(source_total=0, already_liked=0, matched=0, unmatched=0,
+                 liked=0, skipped_state=0, skipped_cooldown=0, errors=0, items=[])
     pl, songs = fetch_favorite_songs(am)
     state["favorites_playlist_id"] = str(pl.get("id") or "")
     stats["source_total"] = len(songs)
-
-    liked_apple = _as_id_set(state.get("liked_apple_ids"))
-    liked_ncm = _as_int_set(state.get("liked_netease_ids")) | set(already_liked)
-    unmatched_map: dict[str, Any] = dict(state.get("unmatched_apple_ids") or {})
-
-    actions = 0
-    scanned = 0
+    pending = state["pending_likes"]
+    unmatched = state["unmatched_apple_ids"]
+    liked_apple = _as_id_set(state["liked_apple_ids"])
+    liked_ncm = _as_int_set(state["liked_netease_ids"]) | already_liked
+    # An unknown like is reconciled against a fresh likelist before another write.
+    for aid, record in list(pending.items()):
+        nid = int(record["netease"]["id"])
+        if nid in already_liked:
+            _remember(state, "liked_apple_ids", aid)
+            _remember(state, "liked_netease_ids", nid)
+            liked_apple.add(aid)
+            pending.pop(aid)
+            unmatched.pop(aid, None)
+            stats["already_liked"] += 1
+    _checkpoint(state, dry_run)
+    # Pending matched writes retain their metadata even if removed from favorites.
+    work = {aid: AppleSong(**record["apple"]) for aid, record in pending.items()}
+    for song in songs:
+        work.setdefault(song.apple_id, song)
+    actions = scanned = 0
     scan_limit = max(limit, FEEDBACK_MAX_LIKE_SCAN_PER_RUN)
-    for i, apple in enumerate(songs, 1):
-        if actions >= limit:
-            log(f"喜爱同步达到本轮写入上限 {limit}，其余下轮继续")
-            break
-        key = apple.apple_id
-        row: dict[str, Any] = {"apple": asdict(apple), "action": None}
-
+    for key, apple in work.items():
         if key in liked_apple:
             stats["skipped_state"] += 1
-            row["action"] = "skip_state"
-            # 不计入 scanned（无 API），快速跳过
             continue
-
-        if scanned >= scan_limit:
-            log(f"喜爱反查达到本轮扫描上限 {scan_limit}，其余下轮继续")
+        # Do this before consuming the search budget, so old misses cannot starve new songs.
+        if _cooling_down(unmatched.get(key)):
+            stats["skipped_cooldown"] += 1
+            continue
+        if actions >= limit or scanned >= scan_limit:
             break
-        scanned += 1
-
-        log(f"[like {i}/{len(songs)}] {apple.artists} - {apple.name}")
-        m = match_netease(cookie, apple)
-        if not m:
-            log("  未匹配网易云")
-            stats["unmatched"] += 1
-            row["action"] = "unmatched"
-            unmatched_map[key] = {
-                "name": apple.name,
-                "artists": apple.artists,
-                "at": datetime.now().isoformat(timespec="seconds"),
-            }
+        log(f"[like] {apple.artists} - {apple.name}")
+        row: dict[str, Any] = {"apple": asdict(apple), "action": None}
+        record = pending.get(key)
+        try:
+            if record:
+                m = record["netease"]
+            else:
+                scanned += 1
+                m = match_netease(cookie, apple)
+        except dr.AuthenticationError:
+            _checkpoint(state, dry_run)
+            raise
+        except Exception as exc:
+            stats["errors"] += 1
+            row.update(action="error", error=_safe_error(exc))
             stats["items"].append(row)
             continue
-
+        if not m:
+            stats["unmatched"] += 1
+            unmatched[key] = {"name": apple.name, "artists": apple.artists,
+                              "at": datetime.now().isoformat(timespec="seconds")}
+            row["action"] = "unmatched"
+            stats["items"].append(row)
+            _checkpoint(state, dry_run)
+            continue
         stats["matched"] += 1
         row["netease"] = m
+        log(f"  → {m['artists']} - {m['name']} id={m['id']} score={m['score']:.0f}")
         nid = int(m["id"])
-        log(
-            f"  → {m['artists']} - {m['name']} id={nid} score={m['score']:.0f}"
-        )
-
         if nid in liked_ncm:
-            log("  已在网易云红心列表，记入 state")
             stats["already_liked"] += 1
             row["action"] = "already_liked"
+            _remember(state, "liked_apple_ids", key)
+            _remember(state, "liked_netease_ids", nid)
             liked_apple.add(key)
-            liked_ncm.add(nid)
-            stats["items"].append(row)
-            continue
-
-        if dry_run:
-            log("  [dry-run] 将红心")
+            unmatched.pop(key, None)
+            pending.pop(key, None)
+        elif dry_run:
             row["action"] = "dry_run_like"
-            actions += 1
             stats["liked"] += 1
-            stats["items"].append(row)
-            continue
-
-        try:
-            resp = ncm_like(cookie, nid, True)
-            code = resp.get("code")
-            if code not in (200, None):
-                log(f"  红心失败: {json.dumps(resp, ensure_ascii=False)[:200]}")
-                row["action"] = "error"
-                row["error"] = resp
+            actions += 1
+        else:
+            actions += 1
+            pending[key] = {"apple": asdict(apple), "netease": m, "status": "unknown"}
+            # If interrupted during a write, the next run must reconcile first.
+            _checkpoint(state, dry_run)
+            stop = False
+            try:
+                response = ncm_like(cookie, nid, True)
+            except dr.AuthenticationError:
+                pending[key]["status"] = "pending"
+                _checkpoint(state, dry_run)
+                raise
+            except Exception as exc:
+                ambiguous = isinstance(exc, (TimeoutError, dr.TransportError)) and getattr(exc, "ambiguous", True)
+                pending[key]["status"] = "unknown" if ambiguous else "pending"
+                # Another Apple entry may resolve to this same NCM song. Wait for
+                # a fresh likelist before allowing any further like writes.
+                stop = ambiguous
                 stats["errors"] += 1
-                # 持续限流则提前结束本轮，留给下次 cron
-                msg = str(resp.get("msg") or resp.get("message") or "")
-                if code == 405 or "频繁" in msg:
-                    log("  触发限流，本轮红心提前结束")
-                    stats["items"].append(row)
-                    break
+                row.update(action="unknown" if ambiguous else "error", error=_safe_error(exc))
             else:
-                log("  已红心")
-                row["action"] = "liked"
-                stats["liked"] += 1
-                liked_apple.add(key)
-                liked_ncm.add(nid)
-                actions += 1
-                unmatched_map.pop(key, None)
+                if isinstance(response, dict) and response.get("code") == 200:
+                    row["action"] = "liked"
+                    stats["liked"] += 1
+                    _remember(state, "liked_apple_ids", key)
+                    _remember(state, "liked_netease_ids", nid)
+                    liked_apple.add(key)
+                    liked_ncm.add(nid)
+                    pending.pop(key)
+                    unmatched.pop(key, None)
+                else:
+                    pending[key]["status"] = "pending"
+                    stats["errors"] += 1
+                    row.update(action="error", error=_response_error(response))
+                    stop = _rate_limited(response)
+            _checkpoint(state, dry_run)
+            stats["items"].append(row)
+            if stop:
+                break
             time.sleep(FEEDBACK_LIKE_SLEEP)
-        except Exception as e:
-            log(f"  红心异常: {e}")
-            row["action"] = "error"
-            row["error"] = str(e)
-            stats["errors"] += 1
+            continue
         stats["items"].append(row)
-
-    state["liked_apple_ids"] = sorted(liked_apple)
-    state["liked_netease_ids"] = sorted(liked_ncm)
-    # 控制 unmatched 体积
-    if len(unmatched_map) > 500:
-        # 保留最近写入的 500 个（按 at 粗排做不到，直接截断）
-        unmatched_map = dict(list(unmatched_map.items())[-500:])
-    state["unmatched_apple_ids"] = unmatched_map
+        _checkpoint(state, dry_run)
+    _checkpoint(state, dry_run)
     return stats
 
 
 def sync_scrobble(
-    cookie: str,
-    am: dr.AppleMusicClient,
-    state: dict[str, Any],
-    dry_run: bool,
-    limit: int,
-    seed_only_first: bool = True,
+    cookie: str, am: dr.AppleMusicClient, state: dict[str, Any],
+    dry_run: bool, limit: int, seed_only_first: bool = True,
 ) -> dict[str, Any]:
-    stats = {
-        "source_total": 0,
-        "new_plays": 0,
-        "seed_only": False,
-        "matched": 0,
-        "unmatched": 0,
-        "scrobbled": 0,
-        "skipped_seen": 0,
-        "errors": 0,
-        "items": [],
-    }
+    _prepare_state(state, existing=True)
+    stats = dict(source_total=0, new_plays=0, seed_only=False, matched=0,
+                 unmatched=0, scrobbled=0, skipped_seen=0, unknown=0, errors=0, items=[])
     songs = fetch_recent_tracks(am, FEEDBACK_RECENT_LIMIT)
     stats["source_total"] = len(songs)
-    current_ids = [s.apple_id for s in songs]
-    seen = _as_id_set(state.get("seen_recent_apple_ids"))
-    scrobbled = _as_id_set(state.get("scrobbled_apple_ids"))
-
-    first_run = len(seen) == 0
-    if first_run and seed_only_first:
-        log(
-            "首次运行：仅写入最近播放快照，不 scrobble "
-            "（避免把历史窗口一次打卡）。下轮起同步新增。"
-        )
+    if not state["recent_initialized"] and seed_only_first:
         stats["seed_only"] = True
-        # 仍匹配打印若干预览
-        for apple in songs[: min(5, len(songs))]:
-            m = match_netease(cookie, apple)
-            log(
-                f"  seed preview: {apple.artists} - {apple.name} → "
-                + (
-                    f"{m['artists']} - {m['name']} ({m['id']})"
-                    if m
-                    else "未匹配"
-                )
-            )
-        state["seen_recent_apple_ids"] = current_ids
-        # 有界
-        state["scrobbled_apple_ids"] = sorted(scrobbled)[-800:]
+        for song in songs:
+            _remember(state, "seen_recent_apple_ids", song.apple_id, RECENT_HISTORY_LIMIT)
+        state["recent_initialized"] = True
+        log("首次运行：仅保存最近播放快照（空快照也完成初始化）")
+        _checkpoint(state, dry_run)
         return stats
-
-    # 新出现在窗口中、且未曾 scrobble 的曲（按 recent 顺序，越靠前越新）
-    new_songs = [
-        s
-        for s in songs
-        if s.apple_id not in seen and s.apple_id not in scrobbled
-    ]
-    stats["new_plays"] = len(new_songs)
-    log(f"增量新播放（相对快照）: {len(new_songs)} 首")
-
+    state["recent_initialized"] = True
+    seen = _as_id_set(state["seen_recent_apple_ids"]) | _as_id_set(state["scrobbled_apple_ids"])
+    pending = state["pending_scrobbles"]
+    for song in songs:
+        if song.apple_id in seen:
+            stats["skipped_seen"] += 1
+        elif song.apple_id not in pending:
+            pending[song.apple_id] = {"apple": asdict(song), "status": "pending"}
+            stats["new_plays"] += 1
+    # Capture the entire snapshot before attempting any writes or hitting a limit.
+    _checkpoint(state, dry_run)
     actions = 0
-    for i, apple in enumerate(new_songs, 1):
-        if actions >= limit:
-            log(f"scrobble 达到本轮上限 {limit}")
-            break
-        log(f"[scrobble {i}/{len(new_songs)}] {apple.artists} - {apple.name}")
+    for key, record in list(pending.items()):
+        apple = AppleSong(**record["apple"])
         row: dict[str, Any] = {"apple": asdict(apple), "action": None}
-        m = match_netease(cookie, apple)
-        if not m:
-            log("  未匹配")
-            stats["unmatched"] += 1
-            row["action"] = "unmatched"
+        if record["status"] == "unknown":
+            row.update(action="unknown", error="打卡结果未知，保留记录待人工核实；不会自动重放")
+            stats["unknown"] += 1
+            stats["errors"] += 1
             stats["items"].append(row)
-            # 仍记入 seen，避免每轮重复搜失败曲
-            seen.add(apple.apple_id)
+            log(f"打卡结果未知，暂不重放 Apple track {key}")
             continue
-
-        stats["matched"] += 1
+        if actions >= limit or (record["status"] == "unmatched" and _cooling_down(record)):
+            continue
+        log(f"[scrobble] {apple.artists} - {apple.name}")
+        actions += 1
+        try:
+            m = record.get("netease") or match_netease(cookie, apple)
+        except dr.AuthenticationError:
+            _checkpoint(state, dry_run)
+            raise
+        except Exception as exc:
+            stats["errors"] += 1
+            row.update(action="error", error=_safe_error(exc))
+            stats["items"].append(row)
+            continue
+        if not m:
+            record.update(status="unmatched", at=datetime.now().isoformat(timespec="seconds"))
+            row["action"] = "unmatched"
+            stats["unmatched"] += 1
+            stats["items"].append(row)
+            _checkpoint(state, dry_run)
+            continue
+        record["netease"] = m
         row["netease"] = m
-        nid = int(m["id"])
-        source_id = int(m.get("album_id") or 0)
+        stats["matched"] += 1
+        log(f"  → {m['artists']} - {m['name']} id={m['id']} score={m['score']:.0f}")
         play_sec = FEEDBACK_SCROBBLE_TIME
         if apple.duration_ms:
-            play_sec = max(30, min(FEEDBACK_SCROBBLE_TIME, apple.duration_ms // 1000 - 1))
-        log(
-            f"  → {m['artists']} - {m['name']} id={nid} "
-            f"score={m['score']:.0f} time={play_sec}s"
-        )
-
+            play_sec = max(30, min(play_sec, apple.duration_ms // 1000 - 1))
         if dry_run:
-            log("  [dry-run] 将 scrobble")
             row["action"] = "dry_run_scrobble"
             stats["scrobbled"] += 1
-            actions += 1
-            stats["items"].append(row)
-            # dry-run 不更新 scrobbled，但更新 seen 会让下轮不重复；
-            # dry-run 下不改 seen/scrobbled 在 main 里统一：此处仍模拟
-            continue
-
-        try:
-            resp = ncm_scrobble(cookie, nid, source_id, play_sec)
-            code = resp.get("code")
-            if code not in (200, None):
-                log(f"  scrobble 失败: {json.dumps(resp, ensure_ascii=False)[:200]}")
-                row["action"] = "error"
-                row["error"] = resp
+        else:
+            record["status"] = "unknown"
+            _checkpoint(state, dry_run)
+            stop = False
+            try:
+                response = ncm_scrobble(cookie, int(m["id"]), int(m.get("album_id") or 0), play_sec)
+            except dr.AuthenticationError:
+                record["status"] = "pending"
+                _checkpoint(state, dry_run)
+                raise
+            except Exception as exc:
+                ambiguous = isinstance(exc, (TimeoutError, dr.TransportError)) and getattr(exc, "ambiguous", True)
+                record["status"] = "unknown" if ambiguous else "pending"
+                row.update(action="unknown" if ambiguous else "error", error=_safe_error(exc))
                 stats["errors"] += 1
+                stats["unknown"] += int(ambiguous)
             else:
-                log("  已 scrobble")
-                row["action"] = "scrobbled"
-                stats["scrobbled"] += 1
-                scrobbled.add(apple.apple_id)
-                seen.add(apple.apple_id)
-                actions += 1
+                if isinstance(response, dict) and response.get("code") == 200:
+                    row["action"] = "scrobbled"
+                    stats["scrobbled"] += 1
+                    _remember(state, "scrobbled_apple_ids", key, SCROBBLE_HISTORY_LIMIT)
+                    _remember(state, "seen_recent_apple_ids", key, RECENT_HISTORY_LIMIT)
+                    pending.pop(key)
+                else:
+                    record["status"] = "pending"
+                    row.update(action="error", error=_response_error(response))
+                    stats["errors"] += 1
+                    stop = _rate_limited(response)
+            _checkpoint(state, dry_run)
+            stats["items"].append(row)
+            if stop:
+                break
             time.sleep(FEEDBACK_REQUEST_SLEEP)
-        except Exception as e:
-            log(f"  scrobble 异常: {e}")
-            row["action"] = "error"
-            row["error"] = str(e)
-            stats["errors"] += 1
+            continue
         stats["items"].append(row)
-
-    # 更新 seen：合并当前窗口（保持较新顺序，截断）
-    merged: list[str] = []
-    have: set[str] = set()
-    for aid in current_ids + list(seen):
-        if aid not in have:
-            have.add(aid)
-            merged.append(aid)
-    state["seen_recent_apple_ids"] = merged[:500]
-    state["scrobbled_apple_ids"] = sorted(scrobbled)[-800:]
-    # 窗口内已见但未进 new 的
-    stats["skipped_seen"] = max(0, len(songs) - len(new_songs))
+    _checkpoint(state, dry_run)
     return stats
 
 
@@ -857,10 +923,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="首次也 scrobble（不推荐；默认首次只建快照）",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.limit < 0:
+        p.error("--limit 必须是非负整数（0=用配置）")
+    return args
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def _run_main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     dry_run = bool(args.dry_run or FEEDBACK_DRY_RUN)
     do_likes = FEEDBACK_SYNC_LIKES and not args.scrobble_only
@@ -873,49 +942,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     dr.LOG_DIR.mkdir(parents=True, exist_ok=True)
     dr.DATA_DIR.mkdir(parents=True, exist_ok=True)
     log_file = dr.LOG_DIR / f"feedback-{dr.TODAY}.log"
-
-    class Tee:
-        def __init__(self, *files):
-            self.files = files
-
-        def write(self, data):
-            for f in self.files:
-                f.write(data)
-                f.flush()
-
-        def flush(self):
-            for f in self.files:
-                f.flush()
-
     log_fp = open(log_file, "a", encoding="utf-8")
-    sys.stdout = Tee(sys.__stdout__, log_fp)  # type: ignore
-    sys.stderr = Tee(sys.__stderr__, log_fp)  # type: ignore
+    sys.stdout = dr.Tee(sys.__stdout__, log_fp)  # type: ignore
+    sys.stderr = dr.Tee(sys.__stderr__, log_fp)  # type: ignore
 
     log(
         f"=== Apple → 网易云反馈 {dr.TODAY} ({dr.RUN_TS}) "
         f"dry_run={dry_run} likes={do_likes} scrobble={do_scrobble} ==="
     )
+    # Reject a corrupt state before making any remote requests.
+    state = load_state()
     dr.ensure_ncm_api()
     cookie = dr.load_cookie()
-
-    uid = 0
-    nickname = "?"
-    try:
-        st = dr.ncm_get("/login/status", cookie)
-        profile = (st.get("data") or {}).get("profile") or {}
-        nickname = str(profile.get("nickname") or "?")
-        uid = int(profile.get("userId") or 0)
-        log(f"网易云账号: {nickname} (uid={uid})")
-    except Exception as e:
-        log(f"警告: 登录状态检查失败: {e}")
-
+    st = dr.ncm_get("/login/status", cookie)
+    profile = (st.get("data") or {}).get("profile") or {}
+    nickname = str(profile.get("nickname") or "?")
+    uid = int(profile.get("userId") or 0)
+    if not uid:
+        raise dr.AuthenticationError("网易云登录失效，请更新 cookie")
+    log(f"网易云账号: {nickname} (uid={uid})")
     already_liked: set[int] = set()
-    if uid and do_likes:
-        try:
-            already_liked = ncm_likelist_ids(cookie, uid)
-            log(f"网易云现有红心: {len(already_liked)} 首")
-        except Exception as e:
-            log(f"警告: 拉取 likelist 失败: {e}")
+    if do_likes:
+        already_liked = ncm_likelist_ids(cookie, uid)
+        log(f"网易云现有红心: {len(already_liked)} 首")
 
     user_token = dr.get_music_user_token()
     dev_token = dr.fetch_web_developer_token()
@@ -924,9 +973,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     sf_id = (sf.get("data") or [{}])[0].get("id")
     log(f"Apple Music storefront: {sf_id}")
 
-    state = load_state()
-    # dry-run 用内存副本，结束不写 state（scrobble 首次 seed 除外？）
-    # 策略：dry-run 完全不持久化；真实运行才 save
     like_stats: Optional[dict[str, Any]] = None
     scrobble_stats: Optional[dict[str, Any]] = None
 
@@ -993,17 +1039,28 @@ def main(argv: Optional[list[str]] = None) -> int:
         log(f"状态: {STATE_FILE}")
 
     log("=== 完成 ===")
-    # 部分成功（有红心/打卡）仍算 OK；仅当零成功且有错误才失败
-    like_ok = int((like_stats or {}).get("liked") or 0)
-    scrob_ok = int((scrobble_stats or {}).get("scrobbled") or 0)
     like_err = int((like_stats or {}).get("errors") or 0)
     scrob_err = int((scrobble_stats or {}).get("errors") or 0)
-    if like_err or scrob_err:
-        if like_ok or scrob_ok or int((like_stats or {}).get("already_liked") or 0):
-            log(f"有限流/部分失败 errors like={like_err} scrobble={scrob_err}，下轮继续")
-            return 0
+    return 1 if like_err or scrob_err else 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    stdout, stderr = sys.stdout, sys.stderr
+    try:
+        return _run_main(argv)
+    except Exception as exc:
+        if isinstance(exc, dr.AuthenticationError):
+            log(_safe_error(exc))
+        else:
+            log(f"反馈停止: {_safe_error(exc)}；请检查配置、连接和状态文件")
         return 1
-    return 0
+    finally:
+        # Tee owns only the log file; never close the caller's output streams.
+        if sys.stdout is not stdout and hasattr(sys.stdout, "files"):
+            for fp in sys.stdout.files:
+                if fp is not sys.__stdout__:
+                    fp.close()
+        sys.stdout, sys.stderr = stdout, stderr
 
 
 if __name__ == "__main__":
