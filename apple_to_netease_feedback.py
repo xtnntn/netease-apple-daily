@@ -793,6 +793,7 @@ def sync_likes(
     for song in songs:
         work.setdefault(song.apple_id, song)
     actions = scanned = 0
+    uncertain_ncm: set[int] = set()
     scan_limit = max(limit, FEEDBACK_MAX_LIKE_SCAN_PER_RUN)
     for key, apple in work.items():
         if key in liked_apple:
@@ -858,6 +859,12 @@ def sync_likes(
             liked_apple.add(key)
             unmatched.pop(key, None)
             pending.pop(key, None)
+        elif nid in uncertain_ncm:
+            # Hold aliases of an uncertain write until next run's fresh likelist.
+            pending[key] = {"apple": asdict(apple), "netease": m, "status": "unknown"}
+            stats["deferred"] += 1
+            row["action"] = "deferred"
+            log("  同曲红心结果待核对，保留到下次；继续处理其他歌曲")
         elif dry_run:
             row["action"] = "dry_run_like"
             stats["liked"] += 1
@@ -877,9 +884,9 @@ def sync_likes(
             except Exception as exc:
                 ambiguous = isinstance(exc, (TimeoutError, dr.TransportError)) and getattr(exc, "ambiguous", True)
                 pending[key]["status"] = "unknown" if ambiguous else "pending"
-                # Another Apple entry may resolve to this same NCM song. Wait for
-                # a fresh likelist before allowing any further like writes.
-                stop = ambiguous
+                if ambiguous:
+                    uncertain_ncm.add(nid)
+                    log("  红心写入结果未知，保留待核对；继续处理其他歌曲")
                 stats["errors"] += 1
                 row.update(action="unknown" if ambiguous else "error", error=_safe_error(exc))
             else:

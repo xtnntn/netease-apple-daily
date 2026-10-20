@@ -299,6 +299,73 @@ class FeedbackTests(unittest.TestCase):
         self.like.assert_called_once()
         self.assertEqual(self.state["liked_apple_ids"], ["1", "2"])
 
+    def test_unknown_like_does_not_block_distinct_songs_across_runs(self):
+        self.favorites.return_value = ({"id": "f"}, [song(1), song(2), song(3)])
+
+        def write(cookie, nid, like):
+            if nid == 1:
+                raise dr.TransportError("secret", ambiguous=True)
+            return {"code": 200}
+
+        self.like.side_effect = write
+        stats = fb.sync_likes("test", None, self.state, set(), False, 2)
+        self.assertEqual([c.args[1] for c in self.like.call_args_list], [1, 2])
+        self.assertEqual((stats["liked"], stats["errors"]), (1, 1))
+        self.state = fb.load_state()
+        self.assertEqual(self.state["pending_likes"]["1"]["status"], "unknown")
+        self.assertEqual(self.state["liked_apple_ids"], ["2"])
+        self.assertNotIn("secret", json.dumps(stats))
+
+        stats = fb.sync_likes("test", None, self.state, {2}, False, 2)
+        self.assertEqual([c.args[1] for c in self.like.call_args_list], [1, 2, 1, 3])
+        self.assertEqual((stats["liked"], stats["errors"]), (1, 1))
+        self.assertEqual(fb.load_state()["liked_apple_ids"], ["2", "3"])
+
+    def test_unknown_like_defers_alias_but_processes_distinct_song(self):
+        self.favorites.return_value = ({"id": "f"}, [song(1), song(2), song(3)])
+
+        def candidate(cookie, apple, **kwargs):
+            return match(cookie, song(1) if apple.apple_id == "2" else apple)
+
+        self.like.side_effect = [dr.TransportError("timeout", ambiguous=True), {"code": 200}]
+        with patch.object(fb, "match_netease", side_effect=candidate):
+            stats = fb.sync_likes("test", None, self.state, set(), False, 3)
+        self.assertEqual([c.args[1] for c in self.like.call_args_list], [1, 3])
+        self.assertEqual((stats["liked"], stats["errors"], stats["deferred"]), (1, 1, 1))
+        saved = fb.load_state()
+        self.assertEqual(set(saved["pending_likes"]), {"1", "2"})
+        self.assertEqual(saved["pending_likes"]["2"]["netease"]["id"], 1)
+        self.assertEqual(saved["liked_apple_ids"], ["3"])
+        self.state = saved
+        self.favorites.return_value = ({"id": "f"}, [])
+        fb.sync_likes("test", None, self.state, {1, 3}, False, 3)
+        self.assertEqual(self.like.call_count, 2)
+        self.assertEqual(set(fb.load_state()["liked_apple_ids"]), {"1", "2", "3"})
+        self.assertEqual(fb.load_state()["pending_likes"], {})
+
+    def test_like_rate_limit_still_stops_distinct_songs(self):
+        self.favorites.return_value = ({"id": "f"}, [song(1), song(2)])
+        for code in (405, 429):
+            with self.subTest(code=code):
+                self.like.reset_mock()
+                self.like.return_value = {"code": code}
+                stats = fb.sync_likes("test", None, self.state, set(), False, 2)
+                self.like.assert_called_once_with("test", 1, True)
+                self.assertEqual(stats["errors"], 1)
+                self.assertEqual(self.state["liked_apple_ids"], [])
+
+    def test_unknown_like_dry_run_preserves_pending_state(self):
+        self.state["pending_likes"]["1"] = {
+            "apple": fb.asdict(song(1)), "netease": match("test", song(1)), "status": "unknown",
+        }
+        fb.save_state(self.state)
+        original = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        self.favorites.return_value = ({"id": "f"}, [song(2)])
+        stats = fb.sync_likes("test", None, self.state, set(), True, 2)
+        self.assertEqual(stats["liked"], 2)
+        self.like.assert_not_called()
+        self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), original)
+
     def test_likes_missing_code_and_auth(self):
         self.favorites.return_value = ({"id": "f"}, [song(1), song(2)])
         self.like.return_value = {"message": "secret"}
